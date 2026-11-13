@@ -1,0 +1,3 @@
+# mem_ol
+
+Initializing repository...
