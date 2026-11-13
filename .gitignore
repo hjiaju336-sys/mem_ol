@@ -1,0 +1,12 @@
+.env
+models/
+logs/
+.idea/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.playwright-mcp/
+*.log
+*.out
+data/worldview/doupo_excerpt.txt

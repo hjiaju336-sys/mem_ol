@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mem-ol-postgres
+    environment:
+      POSTGRES_USER: mem_ol
+      POSTGRES_PASSWORD: mem_ol
+      POSTGRES_DB: mem_ol
+    ports:
+      - "55432:5432"
+    volumes:
+      - mem_ol_pgdata:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/00-extensions.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mem_ol -d mem_ol"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5.26
+    container_name: mem-ol-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/mem_ol_dev
+    ports:
+      - "7475:7474"
+      - "7688:7687"
+    volumes:
+      - mem_ol_neo4j_data:/data
+    restart: unless-stopped
+
+volumes:
+  mem_ol_pgdata:
+  mem_ol_neo4j_data:

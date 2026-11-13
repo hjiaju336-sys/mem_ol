@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>mem_ol 业务逻辑流程图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  body { background: #fff; color: #1f2937; font-family: "Microsoft YaHei", "PingFang SC", sans-serif; padding: 28px; }
+  h1 { font-size: 24px; margin: 0 0 8px; }
+  h2 { font-size: 18px; margin: 28px 0 12px; }
+  p { color: #6b7280; margin: 0 0 18px; }
+  .diagram { overflow-x: auto; }
+</style>
+</head>
+<body>
+  <h1>mem_ol 业务逻辑流程图</h1>
+  <p>单轮对话、召回、后台维护、回退；世界导入见第二张。</p>
+
+  <h2>1. 单轮对话 + 召回 + 后台维护</h2>
+  <div class="diagram">
+  <pre class="mermaid">
+flowchart TD
+    U["玩家输入"] --> PREP["LangGraph prepare<br/>计算 turn_no / 读取最近 5 轮"]
+
+    subgraph TURN["单轮主链路（同步）"]
+        PREP --> A2A["API2-A：单轮总结 + 查询改写<br/>只看上一轮"]
+        PREP --> A2B["API2-B：实体假设<br/>最近 5 轮"]
+        A2A --> CTXQ["上下文 query<br/>rewritten_query + context_summary"]
+        A2B --> ENTQ["实体检索词 entities"]
+        ENTQ --> EK["Neo4j 关键词召回<br/>CJK 全文索引"]
+        ENTQ --> EV["PG entity_index 向量召回"]
+        EK --> FUSE["entity_id 去重 + RRF"]
+        EV --> FUSE
+        FUSE --> EXP["1~2 跳图扩展<br/>节点/边/环路去重"]
+        CTXQ --> CR["子块向量召回<br/>父块展开 + 父块去重"]
+        EXP --> RR["bge-reranker 精排<br/>实体 0.6 / 上下文 0.4"]
+        CR --> RR
+        RR --> GM["GM 生成回复<br/>最近 5 轮原文 + 主线 + 召回"]
+    end
+
+    GM --> PERSIST["persist<br/>消息落库 + 本轮 L0 摘要暂存"]
+    PERSIST --> REPLY["返回玩家"]
+
+    subgraph BG["后台任务（BackgroundTasks，顺序受 ingest_lock 约束）"]
+        API3["API3 实体/属性/关系固化"]
+        ING["5 轮增量向量入库"]
+        PLOTM["主线维护<br/>L0 归档 / 生成 L1 / 更新 L2"]
+    end
+
+    PERSIST --> API3
+    PERSIST --> ING
+    PERSIST --> PLOTM
+
+    subgraph STORE["存储"]
+        PG[("PostgreSQL + pgvector<br/>messages / chunks / entity_index<br/>retrieval_traces / plot_nodes")]
+        NEO[("Neo4j<br/>Entity / AttributeChange / REL")]
+    end
+
+    API3 --> NEO
+    API3 --> PG
+    ING --> PG
+    PERSIST --> L0["L0 单轮摘要"]
+    PLOTM --> L0
+    PLOTM --> L1["L1 章节摘要"]
+    PLOTM --> L2["L2 全局梗概"]
+    L2 --> GM
+    L1 --> GM
+
+    subgraph RB["回退 / 重试"]
+        UI["前端：最近 5 轮<br/>回退 / 重试"]
+        RS["RollbackService<br/>mark rolled_back + 物理删除"]
+    end
+
+    UI -.-> RS
+    RS --> PG
+    RS --> NEO
+    RS --> L0
+    RS --> L1
+    RS --> L2
+  </pre>
+  </div>
+
+  <h2>2. 世界导入（初始 + 增量）</h2>
+  <div class="diagram">
+  <pre class="mermaid">
+flowchart LR
+    WT["世界文本<br/>doc_id / char_start / char_end"] --> SPLIT["按 20000 字切窗"]
+    SPLIT --> PAR["6 路并行抽取<br/>单窗超时 240s；失败二分"]
+    WT --> VEC["父子段切分 + 向量化<br/>只嵌入子块"]
+    PAR --> CONS["整理 agent<br/>按 30000 字符树形合并"]
+    CONS --> MATCH{"会话已有实体？"}
+    MATCH -- 否 --> CREATE["entity_commit_plan<br/>create"]
+    MATCH -- 是 / append --> UPDATE["规范名/别名匹配<br/>update + 新增"]
+    CREATE --> NEO[("Neo4j")]
+    UPDATE --> NEO
+    CREATE --> PG[("PG entity_index")]
+    UPDATE --> PG
+    VEC --> PG
+  </pre>
+  </div>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "default",
+      flowchart: { htmlLabels: true, curve: "basis", nodeSpacing: 36, rankSpacing: 46 }
+    });
+  </script>
+</body>
+</html>
