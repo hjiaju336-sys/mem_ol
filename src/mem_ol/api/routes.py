@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from mem_ol.api.schemas import (
     ChatRequest,
@@ -17,16 +18,12 @@ from mem_ol.api.schemas import (
 from mem_ol.config import Settings
 from mem_ol.log import get_logger
 from mem_ol.mcp_server.tools import EntityToolService
-from mem_ol.pipelines.memory import MemoryPipeline
-from mem_ol.services.entity_commit import EntityCommitService
 from mem_ol.services.game_state import GameStateService
-from mem_ol.services.llm import LLMService, get_llm_service
+from mem_ol.services.llm import get_llm_service
 from mem_ol.services.lorebook import parse_lorebook, select_entries
 from mem_ol.services.opening import OpeningService
-from mem_ol.services.plot_memory import PlotMemoryService
 from mem_ol.services.pre_turn import PreTurnService
 from mem_ol.services.rollback import RollbackService
-from mem_ol.services.world_import import WorldImportService
 from mem_ol.storage.postgres import PostgresStore
 
 router = APIRouter(prefix="/api")
@@ -47,7 +44,9 @@ def _check_lorebook_size(
     if not lorebook:
         return
     try:
-        size = len(json.dumps(lorebook, ensure_ascii=False))
+        size = len(
+            json.dumps(lorebook, ensure_ascii=False).encode("utf-8")
+        )
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="世界书不是合法 JSON") from exc
     if size > max_bytes:
@@ -68,137 +67,6 @@ def _require_thread(
     if thread is None:
         raise HTTPException(status_code=404, detail="thread not found")
     return thread
-
-
-def _run_ingest(
-    store: PostgresStore,
-    settings: Settings,
-    lock,
-    thread_id: uuid.UUID,
-) -> None:
-    with lock:
-        try:
-            MemoryPipeline(store, settings=settings).ingest_pending(thread_id)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "后台对话入库失败",
-                extra={
-                    "event": "memory.ingest.background.failed",
-                    "thread_id": str(thread_id),
-                },
-            )
-
-
-def _run_worldview(
-    store: PostgresStore,
-    settings: Settings,
-    lock,
-    thread_id: uuid.UUID,
-    text: str,
-    source_name: str | None,
-) -> None:
-    with lock:
-        try:
-            MemoryPipeline(store, settings=settings).ingest_worldview(
-                thread_id, text, source_name
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "后台世界观入库失败",
-                extra={
-                    "event": "memory.worldview.background.failed",
-                    "thread_id": str(thread_id),
-                },
-            )
-
-
-def _run_world_import(
-    tools: EntityToolService,
-    llm: LLMService,
-    settings: Settings,
-    lock,
-    thread_id: uuid.UUID,
-    text: str,
-    source_name: str | None,
-    append: bool = False,
-    doc_id: str | None = None,
-    char_start: int = 0,
-    char_end: int | None = None,
-) -> None:
-    with lock:
-        try:
-            WorldImportService(tools, settings=settings, llm=llm).import_world(
-                str(thread_id),
-                text,
-                source_name,
-                append=append,
-                doc_id=doc_id,
-                char_start=char_start,
-                char_end=char_end,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "后台世界导入失败",
-                extra={
-                    "event": "world.import.background.failed",
-                    "thread_id": str(thread_id),
-                },
-            )
-
-
-def _run_plot_maintenance(
-    tools: EntityToolService,
-    llm: LLMService,
-    settings: Settings,
-    lock,
-    thread_id: uuid.UUID,
-    turn_no: int,
-) -> None:
-    with lock:
-        try:
-            PlotMemoryService(
-                tools.store, tools.embedder, llm, settings
-            ).maintain(thread_id, turn_no)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "剧情摘要维护失败",
-                extra={
-                    "event": "plot.maintenance.failed",
-                    "thread_id": str(thread_id),
-                    "turn_no": turn_no,
-                },
-            )
-
-
-def _run_commit(
-    tools: EntityToolService,
-    llm: LLMService,
-    settings: Settings,
-    thread_id: uuid.UUID,
-    user_message: str,
-    gm_reply: str,
-    packet: dict[str, Any],
-    turn_no: int,
-    message_ids: list[str],
-) -> None:
-    try:
-        EntityCommitService(tools, llm, settings).run(
-            thread_id=thread_id,
-            user_message=user_message,
-            gm_reply=gm_reply,
-            packet=packet,
-            turn_no=turn_no,
-            message_ids=message_ids,
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "后台实体固化失败",
-            extra={
-                "event": "api3.commit.background.failed",
-                "thread_id": str(thread_id),
-                "turn_no": turn_no,
-            },
-        )
 
 
 @router.post("/threads")
@@ -313,13 +181,10 @@ def lorebook_preview(
 def chat(
     thread_id: uuid.UUID,
     payload: ChatRequest,
-    background_tasks: BackgroundTasks,
     request: Request,
 ) -> dict[str, Any]:
     store = _store(request)
     settings = _settings(request)
-    tools = _tools(request)
-    llm = get_llm_service()
     _require_thread(store, thread_id)
 
     client_context = (
@@ -357,40 +222,35 @@ def chat(
             "commit_scheduled": False,
         }
 
-    ingest_scheduled = bool(state.get("ingest_required"))
-    if ingest_scheduled:
-        background_tasks.add_task(
-            _run_ingest,
-            store,
-            settings,
-            request.app.state.ingest_lock,
-            thread_id,
+    turn_no = int(state["turn_no"])
+    ingest_scheduled = bool(
+        state.get("ingest_required")
+        and store.enqueue_background_task(
+            thread_id, "ingest", {}, f"turn:{turn_no}"
         )
+    )
 
     packet = state.get("pre_turn") or {}
-    commit_scheduled = bool(state.get("commit_required") and packet)
-    if commit_scheduled:
-        background_tasks.add_task(
-            _run_commit,
-            tools,
-            llm,
-            settings,
+    commit_scheduled = bool(
+        state.get("commit_required")
+        and packet
+        and store.enqueue_background_task(
             thread_id,
-            state.get("narrative_message") or payload.content,
-            state["reply"],
-            packet,
-            int(state["turn_no"]),
-            state.get("message_ids", []),
+            "commit",
+            {
+                "user_message": state.get("narrative_message")
+                or payload.content,
+                "gm_reply": state.get("reply", ""),
+                "packet": packet,
+                "turn_no": turn_no,
+                "message_ids": state.get("message_ids", []),
+            },
+            f"turn:{turn_no}",
         )
+    )
 
-    background_tasks.add_task(
-        _run_plot_maintenance,
-        tools,
-        llm,
-        settings,
-        request.app.state.ingest_lock,
-        thread_id,
-        int(state["turn_no"]),
+    store.enqueue_background_task(
+        thread_id, "plot", {"turn_no": turn_no}, f"turn:{turn_no}"
     )
 
     return {
@@ -441,68 +301,71 @@ def rollback(
 @router.post("/threads/{thread_id}/ingest")
 def ingest_pending(
     thread_id: uuid.UUID,
-    background_tasks: BackgroundTasks,
     request: Request,
 ) -> dict[str, Any]:
     store = _store(request)
-    settings = _settings(request)
     _require_thread(store, thread_id)
     pending = store.count_un_ingested_turns(thread_id)
-    background_tasks.add_task(
-        _run_ingest,
-        store,
-        settings,
-        request.app.state.ingest_lock,
-        thread_id,
+    task_id = store.enqueue_background_task(
+        thread_id, "ingest", {}, f"manual:{uuid.uuid4()}"
     )
-    return {"status": "scheduled", "pending_turns": pending}
+    return {
+        "status": "scheduled",
+        "pending_turns": pending,
+        "task_id": task_id,
+    }
 
 
 @router.post("/threads/{thread_id}/import-world")
 def import_world(
     thread_id: uuid.UUID,
     payload: WorldImportRequest,
-    background_tasks: BackgroundTasks,
     request: Request,
 ) -> dict[str, Any]:
     store = _store(request)
     _require_thread(store, thread_id)
-    background_tasks.add_task(
-        _run_world_import,
-        _tools(request),
-        get_llm_service(),
-        _settings(request),
-        request.app.state.ingest_lock,
+    digest = hashlib.sha1(payload.text.encode("utf-8")).hexdigest()[:16]
+    task_id = store.enqueue_background_task(
         thread_id,
-        payload.text,
-        payload.source_name,
-        payload.append,
-        payload.doc_id,
-        payload.char_start,
-        payload.char_end,
+        "world_import",
+        {
+            "text": payload.text,
+            "source_name": payload.source_name,
+            "append": payload.append,
+            "doc_id": payload.doc_id,
+            "char_start": payload.char_start,
+            "char_end": payload.char_end,
+        },
+        f"{digest}:{payload.doc_id or ''}:"
+        f"{payload.char_start}:{payload.char_end or ''}",
     )
-    return {"status": "scheduled", "chars": len(payload.text)}
+    return {
+        "status": "scheduled",
+        "chars": len(payload.text),
+        "task_id": task_id,
+    }
 
 
 @router.post("/threads/{thread_id}/worldview")
 def add_worldview(
     thread_id: uuid.UUID,
     payload: WorldviewRequest,
-    background_tasks: BackgroundTasks,
     request: Request,
 ) -> dict[str, Any]:
     store = _store(request)
     _require_thread(store, thread_id)
-    background_tasks.add_task(
-        _run_worldview,
-        store,
-        request.app.state.settings,
-        request.app.state.ingest_lock,
+    digest = hashlib.sha1(payload.text.encode("utf-8")).hexdigest()[:16]
+    task_id = store.enqueue_background_task(
         thread_id,
-        payload.text,
-        payload.source_name,
+        "worldview",
+        {"text": payload.text, "source_name": payload.source_name},
+        digest,
     )
-    return {"status": "scheduled", "chars": len(payload.text)}
+    return {
+        "status": "scheduled",
+        "chars": len(payload.text),
+        "task_id": task_id,
+    }
 
 
 @router.get("/threads/{thread_id}/batches")

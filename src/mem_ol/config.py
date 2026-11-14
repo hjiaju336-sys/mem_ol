@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     checkpoint_retention_turns: int = 5
     memory_context_char_limit: int = 700
     gm_max_tokens: int = 800
+    state_judge_max_tokens: int = 1200
     dialogue_history_turns: int = 5
 
     custom_prompt_max_chars: int = 4000

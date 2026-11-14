@@ -33,13 +33,28 @@ def _normalize_choice(
     return text if text in allowed else default
 
 
+def _clip_text(value: Any, limit: int) -> str:
+    """超长截断而非报错：AP2 结果校验失败会把分流降级成叙事，纯 meta 会落库。"""
+    return str(value or "").strip()[:limit]
+
+
 class ActionProposal(BaseModel):
     """LLM 只填意图与对象，数值由引擎决定。"""
 
     kind: str = "other"
-    target: str = Field(default="", max_length=200)
-    approach: str = Field(default="", max_length=500)
+    target: str = ""
+    approach: str = ""
     needs_check: bool = False
+
+    @field_validator("target", mode="before")
+    @classmethod
+    def _clip_target(cls, value: Any) -> str:
+        return _clip_text(value, 200)
+
+    @field_validator("approach", mode="before")
+    @classmethod
+    def _clip_approach(cls, value: Any) -> str:
+        return _clip_text(value, 500)
 
     @model_validator(mode="after")
     def normalize(self) -> "ActionProposal":
@@ -53,7 +68,12 @@ class TurnDirective(BaseModel):
     focus: str | None = None
     options: str | None = None
     tone: str | None = None
-    notes: str = Field(default="", max_length=200)
+    notes: str = ""
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def _clip_notes(cls, value: Any) -> str:
+        return _clip_text(value, 200)
 
     @model_validator(mode="after")
     def normalize(self) -> "TurnDirective":
@@ -72,13 +92,13 @@ class TurnDirective(BaseModel):
 class AP2ContextResult(BaseModel):
     channel: str = "narrative"
     intent: str = "default"
-    context_summary: str = Field(default="", max_length=300)
-    rewritten_query: str = Field(default="", max_length=800)
-    narrative_query: str = Field(default="", max_length=1200)
+    context_summary: str = ""
+    rewritten_query: str = ""
+    narrative_query: str = ""
     directives: TurnDirective = Field(default_factory=TurnDirective)
     action: ActionProposal = Field(default_factory=ActionProposal)
     meta_kind: str = "instruction"
-    meta_question: str = Field(default="", max_length=800)
+    meta_question: str = ""
 
     @field_validator("channel", "intent", "meta_kind", mode="before")
     @classmethod
@@ -89,6 +109,26 @@ class AP2ContextResult(BaseModel):
     @classmethod
     def none_to_dict(cls, value: Any) -> Any:
         return {} if value is None else value
+
+    @field_validator("context_summary", mode="before")
+    @classmethod
+    def _clip_summary(cls, value: Any) -> str:
+        return _clip_text(value, 300)
+
+    @field_validator("rewritten_query", mode="before")
+    @classmethod
+    def _clip_rewritten(cls, value: Any) -> str:
+        return _clip_text(value, 800)
+
+    @field_validator("narrative_query", mode="before")
+    @classmethod
+    def _clip_narrative(cls, value: Any) -> str:
+        return _clip_text(value, 1200)
+
+    @field_validator("meta_question", mode="before")
+    @classmethod
+    def _clip_meta_question(cls, value: Any) -> str:
+        return _clip_text(value, 800)
 
     @model_validator(mode="after")
     def normalize(self) -> "AP2ContextResult":
@@ -104,7 +144,19 @@ class AP2ContextResult(BaseModel):
 
 
 class AP2EntitiesResult(BaseModel):
-    entities: list[str] = Field(default_factory=list, max_length=12)
+    entities: list[str] = Field(default_factory=list)
+
+    @field_validator("entities", mode="before")
+    @classmethod
+    def _clip_entities(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return items[:12]
 
 
 class AP2AnalysisResult(BaseModel):
@@ -120,15 +172,8 @@ class AP2AnalysisResult(BaseModel):
     entities: list[str] = Field(default_factory=list, max_length=12)
 
 
-class GMPlan(BaseModel):
-    intent: str = Field(default="", max_length=32)
-    expected_outcome: str = Field(default="", max_length=300)
-    continuity: str = Field(default="", max_length=300)
-    state_change: str = Field(default="", max_length=300)
-
-
 class NarrativeEffect(BaseModel):
-    """GM 提出的剧情后果；具体数值由引擎校验后写入。"""
+    """状态裁决器提出的剧情后果；具体数值由引擎校验后写入。"""
 
     kind: Literal[
         "hp_delta",
@@ -144,10 +189,40 @@ class NarrativeEffect(BaseModel):
     reason: str = Field(default="", max_length=200)
 
 
-class GMResult(BaseModel):
-    plan: GMPlan | None = None
+class StateJudgeResult(BaseModel):
+    """独立状态裁决调用的输出：effects + 本轮登场角色，不产出正文。"""
+
     effects: list[NarrativeEffect] = Field(default_factory=list)
-    reply: str = Field(min_length=1)
+    appearances: list[str] = Field(default_factory=list)
+
+    @field_validator("appearances", mode="before")
+    @classmethod
+    def _clip_appearances(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        names = [str(item).strip() for item in value if str(item).strip()]
+        return names[:6]
+
+    @field_validator("effects", mode="before")
+    @classmethod
+    def _lenient_effects(cls, value: Any) -> Any:
+        """逐条丢弃非法 effect，一条拼写错误不影响其余后果。"""
+        if not isinstance(value, list):
+            return []
+        kept: list[NarrativeEffect] = []
+        for item in value:
+            try:
+                kept.append(NarrativeEffect.model_validate(item))
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "状态裁决 effect 校验失败，已丢弃",
+                    extra={"event": "state.judge.effect.dropped", "effect": item},
+                )
+        return kept
 
 
 class AttributeChangeInput(BaseModel):

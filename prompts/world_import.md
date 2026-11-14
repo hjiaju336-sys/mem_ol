@@ -27,7 +27,7 @@
    - `aliases`：只放真正的其他称呼（本名、尊称、绰号、繁体/异体）；评价、状态、身份描述不是别名（如“废物”“天才少年”不放入 aliases）。最多 5 个。
    - `type`：按上一条类型规范选择。
    - `description`：30~60 字摘要，只写文本能支持的内容
-   - `attributes`：最多 2 条 `{key,value}`，只写文本明确给出的事实
+   - `attributes`：最多 2 条 `{key,value}`，只写文本明确给出的事实；不要写 HP、攻击力等每轮变化的数值，数值由状态引擎负责
 4. 关系输出 `{source_ref,target_ref,relation_label}`：
    - `source_ref`/`target_ref` 必须是实体列表中的 `canonical_name` 或 `aliases`；
    - `relation_label` 是**自由短语**，2~40 字，不重复两端名字，优先用原文关系词；

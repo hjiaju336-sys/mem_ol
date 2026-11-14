@@ -80,3 +80,30 @@ def test_run_meta_returns_without_recall():
     assert packet["channel"] == "meta"
     assert packet["meta_reply"] == ""
     assert packet["intent"] == "meta"
+
+
+def test_relation_candidates_enter_fusion_below_direct_hits():
+    from mem_ol.services.pre_turn import _fuse_entities, _relation_candidates
+
+    edges = [
+        {
+            "source_id": "e-yaolao",
+            "source_name": "药老",
+            "relation_label": "收为徒弟",
+            "target_id": "e-xiaoyan",
+            "target_name": "萧炎",
+            "score": 3.0,
+        }
+    ]
+    relation = _relation_candidates(edges)
+    assert {item["canonical_name"] for item in relation} == {"药老", "萧炎"}
+    assert {item["route"] for item in relation} == {"relation"}
+
+    fused = _fuse_entities(
+        [{"entity_id": "e-xiaoyan", "canonical_name": "萧炎"}],
+        [{"entity_id": "e-yaolao", "canonical_name": "药老"}],
+        relation,
+    )
+    # 名称直接命中的两个实体排在仅靠关系标签补进来的实体之前。
+    assert fused[0]["entity_id"] == "e-xiaoyan"
+    assert fused[1]["entity_id"] == "e-yaolao"

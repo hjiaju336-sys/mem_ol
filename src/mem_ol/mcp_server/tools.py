@@ -250,6 +250,19 @@ class EntityToolService:
             return {"found": False}
         return {"found": True, **result}
 
+    def characters_created_at(
+        self, thread_id: str, turn_no: int
+    ) -> list[dict[str, Any]]:
+        return self.neo4j.list_characters_created_at(thread_id, int(turn_no))
+
+    @_logged_tool("entity_resolve")
+    def entity_resolve(
+        self, thread_id: str, name: str
+    ) -> dict[str, Any]:
+        """按名字/别名把状态目标挂到实体；查不到返回空。"""
+        result = self.neo4j.find_entity_by_name(thread_id, name)
+        return {"found": result is not None, "entity": result}
+
     @_logged_tool("entity_neighborhood")
     def entity_neighborhood(
         self,
@@ -362,6 +375,18 @@ class EntityToolService:
                     return entity_id
             return None
 
+        def resolve_target(value: str) -> str | None:
+            """关系终点：本轮内的引用 → UUID → 线程内已有的实体名。"""
+            resolved = resolve_ref(value)
+            if resolved:
+                return resolved
+            try:
+                return str(uuid.UUID(value))
+            except ValueError:
+                pass
+            found = self.neo4j.find_entity_by_name(tid, value)
+            return str(found["entity_id"]) if found else None
+
         for decision in parsed:
             if decision.action == "skip":
                 prepared.append(
@@ -372,6 +397,23 @@ class EntityToolService:
                     }
                 )
                 continue
+
+            # 写图前按规范名/别名核对一次，命中已有实体就改成更新，避免重复实体。
+            if decision.action == "create" and decision.canonical_name:
+                existing = self.neo4j.find_entity_by_name(
+                    tid, decision.canonical_name
+                )
+                if existing:
+                    decision.action = "update"
+                    decision.matched_entity_id = str(existing["entity_id"])
+                    logger.info(
+                        "创建前命中已有实体，改为更新",
+                        extra={
+                            "event": "entity.create.merged",
+                            "canonical_name": decision.canonical_name,
+                            "entity_id": str(existing["entity_id"]),
+                        },
+                    )
 
             if decision.action == "create":
                 entity_id = str(uuid.uuid4())
@@ -477,6 +519,7 @@ class EntityToolService:
             )
 
         relation_specs: list[dict[str, Any]] = []
+        dropped_relations = 0
         for decision in parsed:
             if decision.action == "skip":
                 continue
@@ -487,21 +530,39 @@ class EntityToolService:
             )
             source_id = resolve_ref(str(source_ref)) if source_ref else None
             if not source_id:
-                raise ValueError(
-                    f"relation 起点无法解析: {source_ref}"
+                # 单条关系端点解析失败不能拖垮整批实体写入。
+                dropped_relations += len(decision.relations)
+                logger.warning(
+                    "关系起点无法解析，已跳过",
+                    extra={
+                        "event": "entity.relation.source_unresolved",
+                        "source_ref": source_ref,
+                    },
                 )
+                continue
             for relation in decision.relations:
                 target_ref = relation.target_ref.strip()
-                target_id = resolve_ref(target_ref)
+                target_id = resolve_target(target_ref)
                 if not target_id:
-                    try:
-                        target_id = str(uuid.UUID(target_ref))
-                    except ValueError as exc:
-                        raise ValueError(
-                            f"relation target_ref 无法解析: {target_ref}"
-                        ) from exc
+                    dropped_relations += 1
+                    logger.warning(
+                        "关系目标无法解析，已跳过",
+                        extra={
+                            "event": "entity.relation.target_unresolved",
+                            "target_ref": target_ref,
+                        },
+                    )
+                    continue
                 if source_id == target_id:
-                    raise ValueError("不允许自指关系")
+                    dropped_relations += 1
+                    logger.warning(
+                        "不允许自指关系，已跳过",
+                        extra={
+                            "event": "entity.relation.self_reference",
+                            "entity_id": source_id,
+                        },
+                    )
+                    continue
                 relation_specs.append(
                     {
                         # 同一对实体、同一关系类型只有一个稳定 ID，

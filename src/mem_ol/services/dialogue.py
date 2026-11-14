@@ -5,7 +5,6 @@ from typing import Any
 
 from mem_ol.config import Settings, get_settings
 from mem_ol.log import get_logger, log_context
-from mem_ol.domain import GMResult
 from mem_ol.pipelines.query import RetrievalService
 from mem_ol.services.llm import LLMService, get_llm_service
 from mem_ol.services.lorebook import (
@@ -15,11 +14,10 @@ from mem_ol.services.lorebook import (
     select_entries,
 )
 from mem_ol.services.prompts import load_prompt_sections, load_system_prompt
+from mem_ol.services.state_render import format_resolution, format_state_card
 from mem_ol.storage.postgres import PostgresStore
 
 logger = get_logger(__name__)
-
-GM_SYSTEM_PROMPT = load_system_prompt("gm_core.md")
 
 
 class DialogueEngine:
@@ -115,8 +113,16 @@ class DialogueEngine:
                     }
                     for item in raw_retrieved
                 ]
-                system_prompt = self._build_system_prompt(raw_retrieved)
-                lorebook_active = []
+                system_prompt, lorebook_active = (
+                    self._build_system_prompt_from_packet(
+                        {"context_candidates": raw_retrieved},
+                        client_context=client_context,
+                        user_text=user_message,
+                        history_texts=history_texts,
+                        state_view=state_view,
+                        resolution=resolution,
+                    )
+                )
 
             instruction = self._build_turn_instruction(
                 intent=intent,
@@ -125,9 +131,9 @@ class DialogueEngine:
                 client_context=client_context or {},
                 resolution=resolution,
             )
-            json_instruction = load_system_prompt("gm_output.md")
             llm_user_content = (
-                f"{user_message}\n\n{instruction}\n\n{json_instruction}"
+                f"{user_message}\n\n{instruction}\n\n"
+                "只输出故事正文，不要 JSON、不要解释。"
             )
             messages: list[dict[str, str]] = [
                 {"role": "system", "content": system_prompt}
@@ -140,64 +146,26 @@ class DialogueEngine:
                 )
             messages.append({"role": "user", "content": llm_user_content})
 
-            reply = ""
-            plan: dict[str, Any] | None = None
-            gm_effects: list[dict[str, Any]] = []
-            try:
-                result = self.llm.chat_json_model(
-                    GMResult,
-                    messages,
-                    temperature=self.settings.openai_temperature,
-                    max_tokens=self.settings.gm_max_tokens + 2000,
-                    timeout=self.settings.dialogue_timeout,
-                )
-                reply = result.reply.strip()
-                plan = result.plan.model_dump() if result.plan else None
-                gm_effects = [item.model_dump() for item in result.effects]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "GM JSON 输出失败，降级为纯文本生成",
-                    extra={"event": "dialogue.json.failed", "error": str(exc)},
-                )
-                plain_messages = list(messages)
-                plain_messages[-1] = {
-                    "role": "user",
-                    "content": (
-                        f"{user_message}\n\n{instruction}\n\n"
-                        "只输出故事正文，不要 JSON、不要解释。"
-                    ),
-                }
-                reply = self.llm.chat(
-                    plain_messages,
-                    max_tokens=self.settings.gm_max_tokens,
-                    timeout=self.settings.dialogue_timeout,
-                ).strip()
+            # GM 只负责讲故事；状态后果由独立的裁决调用提出。
+            reply = self.llm.chat(
+                messages,
+                temperature=self.settings.openai_temperature,
+                max_tokens=self.settings.gm_max_tokens,
+                timeout=self.settings.dialogue_timeout,
+            ).strip()
             if not reply:
                 logger.warning(
                     "GM 返回空回复，重试一次",
                     extra={"event": "dialogue.reply.empty"},
                 )
-                plain_messages = list(messages)
-                plain_messages[-1] = {
-                    "role": "user",
-                    "content": (
-                        f"{user_message}\n\n{instruction}\n\n"
-                        "只输出故事正文，不要 JSON、不要解释。"
-                    ),
-                }
                 reply = self.llm.chat(
-                    plain_messages,
+                    messages,
+                    temperature=self.settings.openai_temperature,
                     max_tokens=self.settings.gm_max_tokens,
                     timeout=self.settings.dialogue_timeout,
                 ).strip()
             if not reply:
                 raise ValueError("GM 返回空回复")
-
-            if plan:
-                logger.info(
-                    "GM 自检计划",
-                    extra={"event": "dialogue.plan", **plan},
-                )
 
             if turn_no is None:
                 turn_no = self.store.next_turn_no(thread_id)
@@ -224,7 +192,6 @@ class DialogueEngine:
             "turn_no": turn_no,
             "channel": "narrative",
             "intent": intent,
-            "effects": gm_effects,
             "history_messages": len(history),
             "retrieved": retrieved,
             "trace_id": pre_turn.get("trace_id") if pre_turn else None,
@@ -359,10 +326,10 @@ class DialogueEngine:
                 + lorebook_before
             )
 
-        state_block = self._format_state_card(state_view or {})
+        state_block = format_state_card(state_view or {})
         if state_block:
             sections.append(state_block)
-        resolution_block = self._format_resolution(resolution or {})
+        resolution_block = format_resolution(resolution or {})
         if resolution_block:
             sections.append(resolution_block)
 
@@ -492,76 +459,6 @@ class DialogueEngine:
             return ""
         return f"{source} -[{label}]-> {target}"
 
-    def _format_state_card(self, view: dict[str, Any]) -> str:
-        player = view.get("player") or {}
-        if not player:
-            return ""
-        tags = "、".join(player.get("tags") or []) or "无"
-        player_scales = "、".join(
-            f"{key}={value}"
-            for key, value in (player.get("scales") or {}).items()
-        ) or "无"
-        world = view.get("world") or {}
-        time_label = world.get("time_label")
-        lines = [
-            "【当前状态（权威）】",
-            f"时间：{time_label or '未记录'}",
-            f"你：HP {player.get('hp', 0)}/{player.get('max_hp', 0)}，"
-            f"攻击 {player.get('attack', 0)}"
-            f"+{player.get('attack_bonus', 0)}，"
-            f"防御 {player.get('defense', 0)}；状态：{tags}；"
-            f"数值：{player_scales}",
-        ]
-        for target in (view.get("targets") or {}).values():
-            target_tags = "、".join(target.get("tags") or []) or "无"
-            target_scales = "、".join(
-                f"{key}={value}"
-                for key, value in (target.get("scales") or {}).items()
-            ) or "无"
-            lines.append(
-                f"{target.get('name', '对手')}："
-                f"HP {target.get('hp', 0)}/{target.get('max_hp', 0)}；"
-                f"状态：{target_tags}；数值：{target_scales}"
-            )
-        flags = (view.get("world") or {}).get("flags") or {}
-        if flags:
-            lines.append(
-                "世界标记：" + "、".join(f"{key}={value}" for key, value in flags.items())
-            )
-        return "\n".join(lines)
-
-    def _format_resolution(self, resolution: dict[str, Any]) -> str:
-        if not resolution:
-            return ""
-        outcome = {
-            "success": "成功",
-            "failure": "失败",
-            "partial": "部分成功",
-            "critical_success": "大成功",
-            "critical_failure": "大失败",
-            "no_check": "无需检定",
-        }.get(str(resolution.get("outcome")), str(resolution.get("outcome")))
-        lines = [f"【本轮结算（权威，不得改写）】结果：{outcome}"]
-        for roll in resolution.get("rolls") or []:
-            lines.append(
-                f"{roll.get('name', '检定')}：{roll.get('formula', '')}"
-                f"={roll.get('total', '')} vs DC {roll.get('dc', '')}"
-            )
-        facts = resolution.get("facts") or []
-        if facts:
-            lines.append("必须发生：" + "；".join(str(item) for item in facts))
-        deltas = resolution.get("deltas") or []
-        if deltas:
-            changes = [
-                f"{item.get('path')} {item.get('before')}→{item.get('after')}"
-                for item in deltas
-            ]
-            lines.append("数值变化：" + "；".join(changes))
-        lines.append(
-            "必须按以上结果叙述，不得自行掷骰、修改数值或新增未结算结果。"
-        )
-        return "\n".join(lines)
-
     def _lorebook_blocks(
         self,
         client_context: dict[str, Any] | None,
@@ -689,31 +586,3 @@ class DialogueEngine:
             parts.append(notes[:200])
         return parts
 
-    def _build_system_prompt(
-        self, retrieved: list[dict[str, Any]]
-    ) -> str:
-        if not retrieved:
-            return GM_SYSTEM_PROMPT
-
-        blocks: list[str] = []
-        seen: set[str] = set()
-        for item in retrieved:
-            key = item.get("parent_no") or item["chunk_no"]
-            if key in seen:
-                continue
-            seen.add(key)
-            text = item.get("parent_content") or item["content"]
-            text = text.strip()
-            if len(text) > self.settings.memory_context_char_limit:
-                text = text[: self.settings.memory_context_char_limit] + "……"
-            blocks.append(f"[记忆 {item['chunk_no']}]\n{text}")
-
-        if not blocks:
-            return GM_SYSTEM_PROMPT
-
-        return (
-            f"{GM_SYSTEM_PROMPT}\n\n"
-            "以下是与玩家当前行动相关的记忆片段，仅作为叙事依据，"
-            "不要在回复中写出记忆编号：\n\n"
-            + "\n\n".join(blocks)
-        )

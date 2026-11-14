@@ -729,6 +729,23 @@ class PostgresStore:
             conn.commit()
         return int(cursor.rowcount)
 
+    def delete_entity_index(
+        self, thread_id: uuid.UUID | str, entity_ids: list[str]
+    ) -> int:
+        ids = [uuid.UUID(str(item)) for item in entity_ids if item]
+        if not ids:
+            return 0
+        with self.pool.connection() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM entity_index
+                WHERE thread_id = %s AND entity_id = ANY(%s)
+                """,
+                (_as_uuid(thread_id), ids),
+            )
+            conn.commit()
+        return int(cursor.rowcount)
+
     def delete_entity_index_after_turn(
         self, thread_id: uuid.UUID | str, target_turn: int
     ) -> int:
@@ -1399,6 +1416,132 @@ class PostgresStore:
                 """,
                 (_as_uuid(thread_id), list(chunk_nos)),
             ).fetchall()
+
+    # ---------- 后台任务队列 ----------
+
+    def enqueue_background_task(
+        self,
+        thread_id: uuid.UUID | str,
+        kind: str,
+        payload: dict[str, Any],
+        dedupe_key: str,
+    ) -> uuid.UUID | None:
+        """持久化入队；同一线程、类型、幂等键重复入队会被忽略。"""
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO background_tasks
+                    (id, thread_id, kind, dedupe_key, payload)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (thread_id, kind, dedupe_key) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    uuid.uuid4(),
+                    _as_uuid(thread_id),
+                    kind,
+                    str(dedupe_key),
+                    Jsonb(_json_safe(payload)),
+                ),
+            ).fetchone()
+            conn.commit()
+        return row["id"] if row else None
+
+    def claim_background_task(self) -> dict[str, Any] | None:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'running',
+                    attempts = attempts + 1,
+                    updated_at = now()
+                WHERE id = (
+                    SELECT id FROM background_tasks
+                    WHERE status = 'pending' AND next_run_at <= now()
+                    ORDER BY next_run_at
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, thread_id, kind, payload, attempts
+                """
+            ).fetchone()
+            conn.commit()
+        if row is None:
+            return None
+        return {
+            "id": str(row["id"]),
+            "thread_id": str(row["thread_id"]),
+            "kind": row["kind"],
+            "payload": row["payload"] or {},
+            "attempts": int(row["attempts"]),
+        }
+
+    def finish_background_task(
+        self,
+        task_id: uuid.UUID | str,
+        *,
+        error: str | None = None,
+        max_attempts: int = 5,
+        base_delay_s: float = 5.0,
+    ) -> str:
+        """成功置 done；失败按指数退避重排，超过上限置 failed。"""
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM background_tasks WHERE id = %s",
+                (_as_uuid(task_id),),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            attempts = int(row["attempts"])
+            if error is None:
+                conn.execute(
+                    """
+                    UPDATE background_tasks
+                    SET status = 'done', last_error = NULL, updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (_as_uuid(task_id),),
+                )
+                status = "done"
+            elif attempts >= max_attempts:
+                conn.execute(
+                    """
+                    UPDATE background_tasks
+                    SET status = 'failed', last_error = %s, updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (error[:2000], _as_uuid(task_id)),
+                )
+                status = "failed"
+            else:
+                delay = base_delay_s * (2 ** (attempts - 1))
+                conn.execute(
+                    """
+                    UPDATE background_tasks
+                    SET status = 'pending',
+                        last_error = %s,
+                        next_run_at = now() + make_interval(secs => %s),
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (error[:2000], delay, _as_uuid(task_id)),
+                )
+                status = "pending"
+            conn.commit()
+        return status
+
+    def reset_running_background_tasks(self) -> int:
+        """启动时把上次进程崩溃遗留的 running 任务放回队列。"""
+        with self.pool.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE background_tasks
+                SET status = 'pending', next_run_at = now(), updated_at = now()
+                WHERE status = 'running'
+                """
+            )
+            conn.commit()
+        return int(cursor.rowcount)
 
 
 def _json_safe(value: Any) -> Any:

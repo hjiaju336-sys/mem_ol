@@ -142,6 +142,20 @@ def _target_id(name: str) -> str:
     return cleaned if cleaned.startswith("npc:") else f"npc:{cleaned or '对手'}"
 
 
+def ensure_actor(
+    state: dict[str, Any], name: str, entity_id: str = ""
+) -> dict[str, Any]:
+    """确保名字对应的角色存在；新角色给默认数值，并记录实体绑定。"""
+    ensure_state(state)
+    actor_id = _actor_id_for(state, name)
+    actor = state["actors"].setdefault(actor_id, _default_target(name or actor_id))
+    actor.setdefault("tags", [])
+    actor.setdefault("scales", {})
+    if entity_id:
+        actor["entity_id"] = str(entity_id)
+    return actor
+
+
 def _weapon_stats(state: dict[str, Any]) -> dict[str, Any]:
     player = state["actors"]["player"]
     weapon_id = (player.get("equipment") or {}).get("weapon")
@@ -165,6 +179,7 @@ def state_view(state: dict[str, Any]) -> dict[str, Any]:
     targets = {
         actor_id: {
             "name": actor.get("name") or actor_id,
+            "entity_id": str(actor.get("entity_id") or ""),
             "hp": int(actor.get("hp", 0)),
             "max_hp": int(actor.get("max_hp", 0)),
             "tags": list(actor.get("tags", [])),
@@ -274,6 +289,7 @@ def resolve_action(
 
 
 def _actor_id_for(state: dict[str, Any], name: str) -> str:
+    """先找已登记角色；新出现的 NPC 允许登记，便于本轮继续操作。"""
     cleaned = (name or "").strip()
     if cleaned in ("", "player", "你", "玩家"):
         return "player"
@@ -343,13 +359,19 @@ def apply_effects(
             if not tag:
                 rejected.append({**effect, "error": "empty_tag"})
                 continue
-            if kind == "tag_add" and tag not in actor["tags"]:
+            if kind == "tag_add":
+                if tag in actor["tags"]:
+                    rejected.append({**effect, "error": "no_change"})
+                    continue
                 actor["tags"].append(tag)
-            if kind == "tag_remove" and tag in actor["tags"]:
+            else:
+                if tag not in actor["tags"]:
+                    rejected.append({**effect, "error": "no_change"})
+                    continue
                 actor["tags"].remove(tag)
             applied.append({"path": f"actors.{actor_id}.tags", "value": tag, "op": kind, "reason": reason})
         elif kind == "flag_set":
-            flag = field or str(value or "").strip()
+            flag = field
             if not flag:
                 rejected.append({**effect, "error": "empty_flag"})
                 continue

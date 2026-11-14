@@ -22,7 +22,7 @@ pytest
 
 ## 系统定位
 
-**经过验证的可迁移叙事记忆内核**：基于 Graph RAG 变体的对话即时增量记忆层，对话过程中实时写入/变更实体与关系，并支持随对话回退的可变式记忆。内核不绑定具体作品；Streamlit、游戏 GM、数值/时间状态是参考前端与扩展层。60k 外部语料 + 20 轮对话验证见 `docs/eval_glm_2026-11-14.md`。
+**经过验证的可迁移叙事记忆内核**：基于 Graph RAG 变体的对话即时增量记忆层，对话过程中实时写入/变更实体与关系，并支持随对话回退的可变式记忆。内核不绑定具体作品；Streamlit、游戏 GM、数值/时间状态是参考前端与扩展层。60k 外部语料 + 20 轮对话验证，以及玄幻/现实/西幻三套世界观的迁移测试见 `docs/eval_glm_2026-11-14.md`。
 
 **可迁移内容**：世界文本/设定集、GM 提示词与契约、实体/关系 schema 与自由标签、工具/状态/时间引擎、玩家自定义提示词和世界书，均可替换或扩展，不需要改主流程。适用场景：长对话小说生成、文字互动游玩 / AI TRPG、个人陪伴助手、数字人 / 角色代理；共同需求是实时更新、跨多轮一致、初期设定导入和后期自定义。
 
@@ -46,11 +46,12 @@ pytest
 
 ## 当前参考实现
 
-- 对话引擎：`services/dialogue.py`，GM 五段提示词（`gm_core.md` 核心规则 + `gm_contracts.md` 本轮契约 + 玩家自定义 + 世界书 + 记忆）+ 最近 5 轮原始消息上下文（含已入库）；消息按 user/assistant 同一 `turn_no` 落库。GM 返回隐藏 `plan` + `reply`，只使用 `reply`。
+- 对话引擎：`services/dialogue.py`，GM 五段提示词（`gm_core.md` 核心规则 + `gm_contracts.md` 本轮契约 + 玩家自定义 + 世界书 + 记忆）+ 最近 5 轮原始消息上下文（含已入库）；消息按 user/assistant 同一 `turn_no` 落库。GM 只负责讲故事、只输出正文。
+- 状态裁决：`services/state_judge.py` + `prompts/state_judge.md`，GM 正文之后独立调用一次 LLM，读玩家输入、正文、状态卡、本轮结算，输出 `effects`；引擎校验后写回，裁决失败不影响正文。
 - 输入分流：`services/pre_turn.py` 先判断 `narrative/meta/mixed`。纯 meta 指令不生成正文、不落库、不计 turn，前端保存为 `pending_instructions` 下次附带；OOC 问题由 `prompts/gm_meta.md` 单独回答，不进故事正文。
 - 玩家自定义：`ClientContext` 随 `/messages` 携带 `custom_prompt/pending_instructions/lorebook`，服务端不持久化、不写入 checkpoint；世界书由 `services/lorebook.py` 解析 SillyTavern/Character Card V2 格式并按 constant/关键词/概率/预算/位置注入。
-- 数值状态：`services/numeric_engine.py` 最小实现 attack 检定（1d20+攻击 vs 10+防御、伤害、状态标签）、`apply_effects`（hp_delta/tag/flag/scale/time_advance，含重复扣血拦截与范围裁剪）和规则包历法（默认 12 月 × 30 天，时间由 GM 提 `time_advance`、引擎推进）；默认数值/上限/历法在 `src/mem_ol/rules/default.json`，由 `domain/rules.py` 校验并按 mtime 热加载。`services/game_state.py` 读写 PG `game_states`/`state_events`。Graph 增加 `state` 节点在 GM 前结算并注入状态卡/结算，`reconcile` 节点把 GM 提出的剧情后果校验后写回状态；`persist` 落消息后提交状态。`entity_index` 只做召回，不存 HP/攻击力。回退按 `turn_no` 删 `state_events` 并恢复快照。
-- 结构约定：共享枚举/模型在 `domain/`，HTTP 请求模型在 `api/schemas.py`，GM 输出格式在 `prompts/gm_output.md`；`mcp_server/` 只保留工具与 server，业务代码不再从 `mcp_server.schemas` 导入。改规则或提示词后运行 `python scripts/validate_assets.py`。
+- 数值状态：`services/numeric_engine.py` 最小实现 attack 检定（1d20+攻击 vs 10+防御、伤害、状态标签）、`apply_effects`（hp_delta/tag/flag/scale/time_advance，含重复扣血拦截与范围裁剪）和规则包历法（默认 12 月 × 30 天，时间由 GM 提 `time_advance`、引擎推进）；默认数值/上限/历法在 `src/mem_ol/rules/default.json`，由 `domain/rules.py` 校验并按 mtime 热加载。`services/game_state.py` 读写 PG `game_states`/`state_events`。Graph 增加 `state` 节点在 GM 前结算并注入状态卡/结算，`judge` 节点产出剧情后果，`reconcile` 节点校验后写回状态；`persist` 落消息后提交状态。角色 actor 通过 `entity_id` 绑定到 Neo4j 实体（精确规范名/别名匹配），数值仍存 `game_states`。`entity_index` 只做召回，不存 HP/攻击力。回退按 `turn_no` 删 `state_events` 并恢复快照。
+- 结构约定：共享枚举/模型在 `domain/`，HTTP 请求模型在 `api/schemas.py`，状态裁决输出格式在 `prompts/state_judge.md`；`mcp_server/` 只保留工具与 server，业务代码不再从 `mcp_server.schemas` 导入。改规则或提示词后运行 `python scripts/validate_assets.py`。
 - 原始窗口：最近 5 轮常驻；召回结果过滤掉完全落在这 5 轮内的 chunk，避免重复。
 - 增量入库：`pipelines/memory.py`，每 5 个完整轮次一批；不足 5 轮的消息不删，继续作为 LLM 上下文。
 - 切分：`pipelines/chunking.py`，父块 250~900（目标 600），子块 30~120（目标 80，重叠 20）；文本单元先按句切到 ≤80 字；相邻单元 embedding 相似度低于 0.45 时断父块；尾部碎片并入前块。
@@ -60,7 +61,7 @@ pytest
 - 精排：`services/rerank.py`，`bge-reranker-v2-m3`；实体/上下文各取 top10，实体权重 0.6、上下文 0.4；只对 80~120 字子块与压缩实体文本打分（max_length 192），实测 CPU 约 2.6 秒/10 实体、1.5 秒/10 上下文；启动时预热，失败降级为路由分数。
 - 世界观：`kind='worldview'` 批次，测试文本为公有领域《西游记》第一回（`data/worldview/xiyouji_001.txt`），不使用盗版文本。
 - 编排：`graph/conversation.py`，LangGraph 节点 `prepare → pre_turn → generate → persist`；`PostgresSaver` 按 `thread_id` 保存 checkpoint，最终 checkpoint_id 回写 `messages.checkpoint_id`；默认保留最近 5 轮。
-- 后台触发：`persist` 节点计算 `pending_turns/ingest_required`；API 路由在 graph 返回后用 FastAPI `BackgroundTasks` 调度 API 3（每轮）和 5 轮入库（pending>=5）。不是图内 hook/定时轮询，`BackgroundTasks` 非持久化。
+- 后台任务：`persist`/路由计算 `pending_turns/ingest_required/commit_required`，路由把 `commit`（每轮）、`ingest`（pending>=5）、`plot`（每轮）写入 PostgreSQL 表 `background_tasks`（`(thread_id, kind, dedupe_key)` 唯一）；`services/task_worker.py` 的 worker 在 lifespan 中启动，用 `FOR UPDATE SKIP LOCKED` 串行领取执行，成功置 `done`，失败指数退避重试（5 次后 `failed`）；启动时把上次遗留的 `running` 任务放回队列。世界导入/世界观入库也走同一队列。
 - 接口：FastAPI `api/routes.py`；界面：`app/streamlit_app.py`（左侧会话列表，无下拉框；最近 5 轮每轮下有「回退」「重试」，`.streamlit/config.toml` 开启保存自动重跑）。达到 5 轮时由 FastAPI 后台任务触发入库。
 - 开场白：新线程调用 `OpeningService`/`POST /opening`，有世界记忆时召回后生成，否则用通用开场；以 assistant、`turn_no=0` 落库，不参与 5 轮批次计数。
 - 实体记忆：`services/pre_turn.py`（API 2 两路并行：单轮总结+查询改写 / 5 轮实体假设，再做 Neo4j 关键词/PG 向量双路召回 + 上下文召回 + 主线召回）、`services/query_enhancer.py`（LLM 分析失败时的查询改写 fallback）、`services/entity_commit.py`（API 3 判断存在性并写实体/属性/关系）、`services/plot_memory.py`（L0/L1/L2 主线摘要维护）、`services/world_import.py`（世界导入：上下文向量化 + 实体初始化 + 检查修复 agent）、`mcp_server/tools.py`（确定性读取服务 + 实体写工具实现）。
@@ -73,12 +74,12 @@ pytest
 - checkpoint 保留：`checkpoint_retention_turns=5`；每轮结束后清理旧轮 checkpoints/writes/blobs，并置空旧消息的 checkpoint_id。
 - LLM JSON：`finish_reason=length` 时提高 max_tokens 重试；解析失败用 `json_repair` 修复；提示词约束单行字符串/禁用未转义双引号。API2/API3/GM/开场白统一 `dialogue_timeout=120s`；429/5xx 在 `LLMService._create` 内退避重试 3 次（5s/10s）；`chat_json_model(model_cls, ...)` 做 pydantic 结构校验，失败时把错误回传模型重试一次。
 - 回退：`services/rollback.py`，按 turn 级 provenance 物理删除 PostgreSQL chunks/entity_index/mentions/traces 与 Neo4j 实体/关系，checkpoint 只用于对话状态，不能替代数据库回退。
-- 尚未实现：实体合并、失败任务重试/REINDEX 后台维护。
+- 尚未实现：定时实体合并（有手动脚本 `scripts/merge_duplicate_entities.py`）、REINDEX/维护计数后台任务、状态管道（情绪/场景滚动状态）。
 
 ## 实体记忆（已实现）
 
 - 设计文档：`docs/entity_memory_design.md`；业务流程/流程图：`docs/business_flow.md`；提示词：`prompts/api2_context.md`（单轮总结 + 查询改写）、`prompts/api2_entities.md`（实体假设）、`prompts/entity_commit.md`（API 3）、`prompts/plot_arc.md`/`plot_global.md`（主线摘要）。
-- 流程：API 2 拆成两路并行 LLM：①输入分流（`channel`）+ 单轮总结/查询改写（只看上一轮，输出 `context_summary/rewritten_query`；meta 时输出 `directives/meta_question`）；②实体假设（看最近 5 轮，输出扁平 `entities`）→ 纯 meta 直接返回空正文；narrative/mixed 用 `rewritten_query + context_summary` 召回，实体用检索词做一次关键词召回 + 一次向量召回 → `entity_id` 去重/RRF → 1~2 跳图扩展 → 上下文父块去重 → 精排 → 主 GM（五段提示词 + 隐藏 plan）→ API 3 判断存在性并写实体/属性/关系。
+- 流程：API 2 拆成两路并行 LLM：①输入分流（`channel`）+ 单轮总结/查询改写（只看上一轮，输出 `context_summary/rewritten_query`；meta 时输出 `directives/meta_question`）；②实体假设（看最近 5 轮，输出扁平 `entities`）→ 纯 meta 直接返回空正文；narrative/mixed 用 `rewritten_query + context_summary` 召回，实体用检索词做一次关键词召回 + 一次向量召回 → `entity_id` 去重/RRF → 1~2 跳图扩展 → 上下文父块去重 → 精排 → 主 GM（五段提示词，只写正文）→ 独立状态裁决（`state_judge.md` 输出 effects）→ API 3 判断存在性并写实体/属性/关系。
 - 主线记忆：`plot_nodes` 三层结构。L0 单轮摘要（每轮一次，active，离开 5 轮窗口后归档向量化）；L1 章节摘要（每 5 条 L0 合并，`plot_arc_size=5`）；L2 全局梗概（每个新章节递归合并）。GM 提示词常驻 L2，按 `turn_end <= current_turn-5` 召回相关 L1，L0 仅在没有 L2/L1 时兜底；回退按 turn 删除对应节点。
 - 存储：**Neo4j 是实体权威**（`Entity/AttributeChange/REL`，属性 append-only）；PostgreSQL 只存派生 `entity_index`（名称/别名/类型 + 1024 维向量）和 `entity_mentions/retrieval_traces/tool_call_logs` 留痕。PG 索引失败不阻塞实体写入，可重建。
 - MCP：工具实现在 `mcp_server/tools.py`；MCP server 只暴露写工具 `entity_commit_plan`；确定性读取/召回由编排层直接调用服务方法。API 2/3 默认 in-process 调用，`scripts/run_mcp_server.py` 提供 streamable HTTP MCP（127.0.0.1:8765）。

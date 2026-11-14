@@ -149,7 +149,8 @@ class PreTurnService:
 
             keyword_candidates: list[dict[str, Any]] = []
             vector_candidates: list[dict[str, Any]] = []
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            relation_candidates: list[dict[str, Any]] = []
+            with ThreadPoolExecutor(max_workers=5) as executor:
                 context_future = executor.submit(
                     self._context_recall, tid, context_query, context_vector
                 )
@@ -158,6 +159,7 @@ class PreTurnService:
                 )
                 keyword_future = None
                 vector_future = None
+                relation_future = None
                 if terms:
                     keyword_future = executor.submit(
                         self.tools.entity_recall_keyword,
@@ -171,6 +173,12 @@ class PreTurnService:
                         query=entity_query,
                         limit=self.settings.entity_recall_top_k,
                         vector=entity_vector,
+                    )
+                    relation_future = executor.submit(
+                        self.tools.relation_recall_keyword,
+                        thread_id=tid,
+                        keywords=terms,
+                        limit=self.settings.entity_recall_top_k,
                     )
                 if keyword_future is not None:
                     try:
@@ -198,10 +206,25 @@ class PreTurnService:
                                 "error": str(exc),
                             },
                         )
+                if relation_future is not None:
+                    try:
+                        relation_candidates = _relation_candidates(
+                            relation_future.result().get("candidates", [])
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception(
+                            "关系标签召回失败",
+                            extra={
+                                "event": "api2.entity.relation.failed",
+                                "error": str(exc),
+                            },
+                        )
                 context_candidates = context_future.result()
                 plot_context = plot_future.result()
 
-            fused = _fuse_entities(keyword_candidates, vector_candidates)
+            fused = _fuse_entities(
+                keyword_candidates, vector_candidates, relation_candidates
+            )
             entity_candidates = self._load_details(
                 tid, fused[: self.settings.entity_candidate_top_k]
             )
@@ -838,16 +861,44 @@ def _dedupe_contexts_by_parent(
     )
 
 
+def _relation_candidates(
+    edges: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """关系标签命中的边，两端实体各算一个候选。"""
+    candidates: list[dict[str, Any]] = []
+    for rank, edge in enumerate(edges, start=1):
+        for side in ("source", "target"):
+            entity_id = edge.get(f"{side}_id")
+            if not entity_id:
+                continue
+            candidates.append(
+                {
+                    "entity_id": str(entity_id),
+                    "canonical_name": edge.get(f"{side}_name"),
+                    "relation_label": edge.get("relation_label"),
+                    "route": "relation",
+                    "route_rank": rank,
+                    "route_score": float(edge.get("score", 0.0)),
+                }
+            )
+    return candidates
+
+
 def _fuse_entities(
     keyword_candidates: Sequence[dict[str, Any]],
     vector_candidates: Sequence[dict[str, Any]],
+    relation_candidates: Sequence[dict[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
-    for route, candidates in (
-        ("keyword", keyword_candidates),
-        ("vector", vector_candidates),
+    for route, weight, candidates in (
+        # 关系标签是补充证据：按标签反查到的实体不应压过名称直接命中。
+        ("keyword", 1.0, keyword_candidates),
+        ("vector", 1.0, vector_candidates),
+        ("relation", 0.5, relation_candidates),
     ):
-        for rank, item in enumerate(candidates, start=1):
+        for position, item in enumerate(candidates, start=1):
+            # 关系路一条边贡献两个端点，两端应共享同一个名次。
+            rank = int(item.get("route_rank") or position)
             entity_id = item.get("entity_id") or item.get("id")
             if not entity_id:
                 continue
@@ -869,7 +920,7 @@ def _fuse_entities(
             entry["route_scores"][route] = float(
                 item.get("route_score", item.get("score", 0.0))
             )
-            entry["rrf_score"] += 1.0 / (60 + rank)
+            entry["rrf_score"] += weight / (60 + rank)
             if not entry.get("canonical_name"):
                 entry["canonical_name"] = item.get("canonical_name")
             if not entry.get("entity_type"):

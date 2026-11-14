@@ -197,3 +197,45 @@ def test_non_attack_has_no_resolution():
     )
     assert resolution is None
     assert state["actors"]["player"]["hp"] == 20
+
+
+def test_flag_set_requires_field():
+    state = new_game_state()
+    state, applied, rejected = apply_effects(
+        state, [{"kind": "flag_set", "value": True}]
+    )
+    assert applied == []
+    assert rejected[0]["error"] == "empty_flag"
+    assert not state["world"].get("flags")
+
+
+def test_tag_no_op_is_rejected_and_empty_time_advance_is_allowed():
+    state = new_game_state()
+    state, applied, rejected = apply_effects(
+        state,
+        [
+            {"kind": "tag_remove", "target": "player", "value": "不存在"},
+            # 零时长推进是合法的（时间静止等剧情），引擎不改时间但不算失败。
+            {"kind": "time_advance", "value": {}},
+        ],
+    )
+    assert [item["path"] for item in applied] == ["world.time"]
+    assert rejected[0]["error"] == "no_change"
+    assert state["world"]["time"]["day"] == 1
+
+
+def test_new_npc_target_creates_actor():
+    # 新出现的 NPC 允许登记，后续轮次才能继续扣血/加状态。
+    state = new_game_state()
+    state, applied, rejected = apply_effects(
+        state, [{"kind": "scale_delta", "target": "守卫", "field": "alert", "value": 10}]
+    )
+    assert not rejected
+    assert state["actors"]["npc:守卫"]["scales"]["alert"] == 10
+
+
+def test_state_view_exposes_entity_id():
+    state = new_game_state()
+    state["actors"]["npc:守卫"] = {"name": "守卫", "entity_id": "e-guard"}
+    view = state_view(state)
+    assert view["targets"]["npc:守卫"]["entity_id"] == "e-guard"

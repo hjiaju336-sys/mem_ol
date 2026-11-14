@@ -10,7 +10,7 @@ mem_ol 不是绑定某一部作品的 Demo，而是一个**与题材解耦的叙
 
 完整设计规格见 [需求](需求)，工程约定见 [CLAUDE.md](CLAUDE.md)，当前真实业务流程与流程图见 [docs/business_flow.md](docs/business_flow.md)。
 
-> 当前状态：内核链路已验证——60k 外部语料导入、20 轮对话、5 轮增量入库、双路召回、L1/L2 主线、时间推进、turn 级回退均已跑通。后台任务持久化、多租户、正式评测集仍属于产品化边界。
+> 当前状态：内核链路已验证——60k 外部语料导入、20 轮对话、玄幻/现实/西幻三套世界观的迁移测试、5 轮增量入库、双路召回、L1/L2 主线、状态裁决、时间推进、turn 级回退、PG 后台任务队列均已跑通。多租户、正式评测集仍属于产品化边界。
 
 ## 验证
 
@@ -23,9 +23,11 @@ mem_ol 不是绑定某一部作品的 Demo，而是一个**与题材解耦的叙
 | 长程召回 | 8~12 轮前事实 5/5 top-1 | [边界评测](docs/eval_v2_2026-11-13.md) |
 | 回退 | 回退轮次事实消失，更早事实保留 | 同上 |
 | 时间管理 | 10 次 `time_advance`，第1年1月1日 08:00 → 1月7日 09:40 | [GLM 评测](docs/eval_glm_2026-11-14.md) |
-| 自动化测试 | 79 passed | `pytest` |
+| 跨题材迁移 | 玄幻 10k 字 + 现实 49k 字 + 原创西幻：导入、5~14 轮对话、状态/时间/实体绑定均通过 | [GLM 评测](docs/eval_glm_2026-11-14.md) |
+| 后台任务 | PG `background_tasks` + worker：崩溃恢复、失败退避、正常一轮 commit/plot 均验证 | 同上 |
+| 自动化测试 | 94 passed | `pytest` |
 
-**可迁移性边界**：内核的提示词、schema、规则包不绑定具体作品，已用一部外部 60k 文本和一个合成对话验证；尚未做第二部文本的跨域复验，因此“可迁移”目前是**经过一次外部验证的内核定位**，不是多域 benchmark 结论。
+**可迁移性边界**：内核的提示词、schema、规则包不绑定具体作品，已用玄幻、现实、西幻三套世界文本验证（10k / 49k / ~2k 字）。这是手工迁移验证，不是多域 benchmark；数值/玩法层仍是参考实现。
 
 ## 可迁移内容
 
@@ -34,7 +36,7 @@ mem_ol 不是绑定某一部作品的 Demo，而是一个**与题材解耦的叙
 | 可迁移层 | 内容 | 入口 |
 |---|---|---|
 | 世界设定 | 小说、设定集、世界观文本、增量段落 | `POST /import-world` / `scripts/seed_worldview.py` |
-| GM 角色与文风 | 角色约束、响应契约、OOC 规则、输出 JSON 格式 | `prompts/gm_core.md`、`gm_contracts.md`、`gm_meta.md`、`gm_output.md` |
+| GM 角色与文风 | 角色约束、响应契约、OOC 规则、状态裁决规则 | `prompts/gm_core.md`、`gm_contracts.md`、`gm_meta.md`、`state_judge.md` |
 | 实体与关系 | 实体类型、自由关系标签、别名、事件实体化 | `src/mem_ol/domain/enums.py`、`domain/models.py`、导入/固化提示词 |
 | 玩家自定义 | 自定义提示词、SillyTavern/V2 世界书、待生效临时要求 | 前端 `ClientContext`，服务端不落库 |
 | 工具与状态引擎 | 检定、伤害、资源、时间/历法、效果上限 | `services/numeric_engine.py`、`rules/default.json`、`services/game_state.py` |
@@ -146,7 +148,9 @@ mem_ol/
 │   ├── services/
 │   │   ├── embedding.py          # bge-large-zh-v1.5
 │   │   ├── llm.py                # Chat Completions + JSON 输出
-│   │   ├── dialogue.py           # GM 提示词拼装 + 隐藏 plan + 状态/结算注入
+│   │   ├── dialogue.py           # GM 提示词拼装 + 状态/结算注入（只写正文）
+│   │   ├── state_judge.py        # 独立状态裁决 LLM：正文 → effects
+│   │   ├── state_render.py       # 状态卡 / 结算文本渲染（GM 与裁决共用）
 │   │   ├── numeric_engine.py     # 最小数值引擎：攻击检定、伤害、状态
 │   │   ├── game_state.py         # 游戏状态读写入口（JSONB）
 │   │   ├── lorebook.py           # SillyTavern/V2 世界书解析、触发、渲染
@@ -156,11 +160,13 @@ mem_ol/
 │   │   ├── opening.py            # 新线程开场白生成
 │   │   ├── world_import.py       # 世界导入：向量化 + 实体初始化
 │   │   ├── query_enhancer.py     # LLM 分析失败时的查询改写 fallback
+│   │   ├── maintenance.py        # 后台任务执行函数（commit/ingest/plot/导入）
+│   │   ├── task_worker.py        # PG 任务队列消费者（退避重试/崩溃恢复）
 │   │   └── prompts.py            # 提示词加载与渲染
 │   ├── mcp_server/
 │   │   ├── tools.py              # 唯一 DB 工具实现（in-process + MCP）
 │   │   └── server.py             # MCP streamable HTTP server
-│   ├── graph/conversation.py     # LangGraph：prepare→pre_turn→state→generate→reconcile→persist
+│   ├── graph/conversation.py     # LangGraph：prepare→pre_turn→state→generate→judge→reconcile→persist
 │   └── api/
 │       ├── main.py               # FastAPI app + lifespan
 │       ├── schemas.py            # 请求/客户端上下文模型
@@ -177,7 +183,7 @@ mem_ol/
 │   ├── gm_core.md                # GM 核心规则
 │   ├── gm_contracts.md           # 按 intent 的响应契约
 │   ├── gm_meta.md                # OOC 元问答
-│   ├── gm_output.md              # GM JSON 输出格式与 effects 约束
+│   ├── state_judge.md            # 状态裁决：正文 → effects 的 JSON 约束
 │   ├── plot_arc.md               # L1 章节摘要合并
 │   ├── plot_global.md            # L2 全局主线梗概
 │   ├── entity_commit.md          # API 3 提示词
@@ -188,6 +194,7 @@ mem_ol/
 │   ├── validate_assets.py        # 校验规则包与提示词
 │   ├── prepare_worldview.py      # 清理 Wiki 文本
 │   ├── seed_worldview.py         # 导入世界：向量化 + 实体初始化
+│   ├── merge_duplicate_entities.py  # 合并同线程重复实体（dry-run/--apply）
 │   ├── eval_memory.py            # 世界检索 + 实体双路评测
 │   ├── eval_dialogue_memory.py   # 5 轮增量对话记忆评测
 │   ├── eval_suite.py             # 分类型套件：事实/别名/关系/指代/时间/窗口外
@@ -252,17 +259,18 @@ mem_ol/
 - state 字段：`thread_id`、`turn_no`、`user_message`、`pre_turn` recall packet、`reply`、`message_ids`、`trace_id`、`pending_turns`、`commit_required`、`ingest_required`、`turn_checkpoint_id`。
 - checkpoint：`PostgresSaver` 使用同一个 PostgreSQL，按 `thread_id` 保存；每轮结束取最终 `checkpoint_id` 回写到 `messages.checkpoint_id`。
 - `prepare` 每轮强制从 DB 取新的 `turn_no` 并清空上一轮字段；LangGraph 会恢复上一轮 state，不能直接复用。
-- API 3 与 5 轮入库仍由 API 后台任务触发；图 state 提供 recall packet、reply 和 message_ids。
+- API 3、5 轮入库、主线维护由 PG 任务队列触发；图 state 提供 recall packet、reply 和 message_ids。
 - `get_state_history` 可以查看每轮节点级快照；默认只保留最近 5 轮（`CHECKPOINT_RETENTION_TURNS=5`），更早的 checkpoints/writes/blobs 会被清理，旧消息的 `checkpoint_id` 置空。
 
 ### 后台触发流程
 
 - 图里的 `persist` 节点落库后计算 `pending_turns` 和 `ingest_required`。
-- 路由在 `graph.run()` 返回后通过 FastAPI `BackgroundTasks` 调度：
+- 路由把任务写入 PostgreSQL `background_tasks` 表：
   - `commit_required` → API 3 实体固化（每轮）
   - `ingest_required` → 5 轮增量入库（仅 `pending_turns >= 5`）
-- 这不是 LangGraph 图内 hook，也不是定时轮询；`BackgroundTasks` 在响应后执行，进程重启会丢失。
-- `POST /api/threads/{id}/ingest` 可手动补偿入库；API 3 暂无自动重试。
+  - 每轮 → 主线维护
+- `services/task_worker.py` 在 lifespan 启动，`FOR UPDATE SKIP LOCKED` 串行领取；失败按 5s/10s/20s/40s 退避重试，5 次后置 `failed`；启动时回收遗留 `running` 任务。进程重启不丢任务。
+- `POST /api/threads/{id}/ingest` 可手动补偿入库。
 
 ## 日志
 
@@ -277,7 +285,7 @@ mem_ol/
 pytest
 ```
 
-当前覆盖：日志 JSON 字段契约、语义父子段切分、消息/轮次溯源、提示词加载/渲染、实体决策 schema、精排权重、父块去重、LangGraph checkpoint、API 2 结构化输出、输入分流/元交互、GM 提示词拼装、世界书解析与触发、世界导入窗口切分、开场白落库、turn 级 chunk 编号、关系自由标签、source_order（79 passed）。端到端另外手工验证了 API 2/3、实体/关系写入、多跳路径、精排、世界导入、增量导入、7 轮主线摘要与回退。
+当前覆盖：日志 JSON 字段契约、语义父子段切分、消息/轮次溯源、提示词加载/渲染、实体决策 schema、精排权重、父块去重、LangGraph checkpoint、API 2 结构化输出、输入分流/元交互、GM 提示词拼装、世界书解析与触发、世界导入窗口切分、开场白落库、turn 级 chunk 编号、关系自由标签、source_order（94 passed）。端到端另外手工验证了 API 2/3、实体/关系写入、多跳路径、精排、世界导入、增量导入、7 轮主线摘要与回退。
 
 ### 记忆评测
 
@@ -333,8 +341,9 @@ python scripts/eval_boundary.py
 5. 上下文用增强后的 query 召回 30 个子块，按 `parent_no` **父块去重**：同一父块只保留得分最高的子块作为代表，其余 sibling 记在 `child_chunk_nos`，再取 top10 父块。
 6. 实体/上下文分别用 `bge-reranker-v2-m3` 精排；实体权重 0.6、上下文 0.4。
 7. **主线召回**：`context_summary` 离开 5 轮窗口后归档并向量化；L2 全局梗概常驻 GM 提示词，L1 章节摘要按 `turn_end <= current_turn-5` 检索，L0 仅在无 L1/L2 时兜底。
-8. **主 GM** 按五段拼装提示词：核心规则 + 本轮响应契约（action/investigate/social/combat/daily/cultivation/inquiry/default）+ 玩家自定义 + 世界书命中条目 + 记忆；最近 5 轮原始消息始终作为完整上下文。GM 先输出隐藏的 `plan` 自检字段，代码只取 `reply` 返回。
-9. **API 3** 在后台判断实体存在性，输出 create/update/skip + 属性变更 + 关系，经 `entity_commit_plan` 写入。
+8. **主 GM** 按五段拼装提示词：核心规则 + 本轮响应契约（action/investigate/social/combat/daily/cultivation/inquiry/default）+ 玩家自定义 + 世界书命中条目 + 记忆；最近 5 轮原始消息始终作为完整上下文。GM 只输出故事正文。
+9. **状态裁决**（独立 LLM，`state_judge.md`）：读玩家输入、GM 正文、当前状态卡和本轮结算，输出 `effects`；引擎逐条校验后写回状态，裁决失败不影响正文。
+10. **API 3** 在后台判断实体存在性，输出 create/update/skip + 属性变更 + 关系，经 `entity_commit_plan` 写入。
 
 输入分流与玩家自定义：
 
@@ -378,7 +387,7 @@ MCP：
 - LLM JSON 已增加截断检测（`finish_reason=length` 提高 token 重试）、`json-repair` 修复和更严格的提示词；仍可能失败，但日志会记录 `finish_reason` 与响应长度。
 - API 2/3 的确定性读取与召回通过 in-process 服务方法调用；MCP server 目前只暴露 `entity_commit_plan` 写工具，HTTP MCP client 适配层尚未接入。
 - 实体匹配阈值暂定 0.75；世界导入的重复实体由整理 agent 合并，API3 跨轮合并仍依赖候选与模型判断。
-- 回退与指代解析已接入；后台任务持久化、状态管道、REINDEX 维护尚未实现。
+- 回退与指代解析已接入；后台任务已持久化（PG 队列 + worker）；重复实体有手动合并脚本；状态管道（情绪/场景滚动状态）与 REINDEX 维护尚未实现。
 - CPU embedding 较慢（约 40~60 秒 / 万字符），入库已放到后台任务。
 - 《西游记》属于 LLM 常识，只能验证链路；验收记忆效果需换私有/合成世界观文本。
 - 无认证与多租户，当前按线程隔离。

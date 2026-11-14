@@ -10,8 +10,14 @@ from mem_ol.log import get_logger, log_context
 from mem_ol.mcp_server.tools import EntityToolService
 from mem_ol.services.dialogue import DialogueEngine
 from mem_ol.services.game_state import GameStateService
-from mem_ol.services.numeric_engine import apply_effects, resolve_action, state_view
+from mem_ol.services.numeric_engine import (
+    apply_effects,
+    ensure_actor,
+    resolve_action,
+    state_view,
+)
 from mem_ol.services.pre_turn import PreTurnService
+from mem_ol.services.state_judge import StateJudge
 from mem_ol.storage.postgres import PostgresStore
 
 logger = get_logger(__name__)
@@ -32,6 +38,7 @@ class ConversationState(TypedDict, total=False):
     resolution: dict[str, Any] | None
     state_after: dict[str, Any]
     effects: list[dict[str, Any]]
+    appearances: list[str]
     applied_effects: list[dict[str, Any]]
     effects_rejected: list[dict[str, Any]]
     query_analysis: dict[str, Any]
@@ -62,8 +69,10 @@ class ConversationGraph:
         pre_turn_service: PreTurnService | None = None,
         dialogue_engine: DialogueEngine | None = None,
         game_state_service: GameStateService | None = None,
+        state_judge: StateJudge | None = None,
     ) -> None:
         self.store = store
+        self.tools = tools
         self.settings = settings or get_settings()
         self.pre_turn_service = pre_turn_service or PreTurnService(
             tools, settings=self.settings
@@ -72,6 +81,7 @@ class ConversationGraph:
             store, settings=self.settings
         )
         self.game_state = game_state_service or GameStateService(store)
+        self.state_judge = state_judge or StateJudge(settings=self.settings)
         self._lock = threading.Lock()
         # 玩家侧内容不进 LangGraph state，避免被 checkpoint 落库。
         self._client_context: dict[str, Any] = {}
@@ -83,6 +93,7 @@ class ConversationGraph:
         builder.add_node("pre_turn", self._pre_turn)
         builder.add_node("state", self._state)
         builder.add_node("generate", self._generate)
+        builder.add_node("judge", self._judge)
         builder.add_node("reconcile", self._reconcile)
         builder.add_node("persist", self._persist)
         builder.add_edge(START, "prepare")
@@ -93,7 +104,8 @@ class ConversationGraph:
             {"state": "state", "end": END},
         )
         builder.add_edge("state", "generate")
-        builder.add_edge("generate", "reconcile")
+        builder.add_edge("generate", "judge")
+        builder.add_edge("judge", "reconcile")
         builder.add_edge("reconcile", "persist")
         builder.add_edge("persist", END)
         return builder.compile(checkpointer=checkpointer)
@@ -347,10 +359,73 @@ class ConversationGraph:
                 "pre_turn_error": str(exc),
             }
 
+    def _bind_entities(
+        self,
+        thread_id: str,
+        game_state: dict[str, Any],
+        names: list[Any],
+    ) -> dict[str, Any]:
+        """把角色状态挂到实体：按规范名/别名精确匹配，查不到就保持未绑定。"""
+        actors = game_state.get("actors") or {}
+        for name in {str(item or "").strip() for item in names}:
+            if not name or name in ("player", "你", "玩家"):
+                continue
+            try:
+                resolved = self.tools.entity_resolve(thread_id, name)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "实体绑定失败，跳过",
+                    extra={
+                        "event": "state.entity.bind.failed",
+                        "name": name,
+                        "error": str(exc),
+                    },
+                )
+                continue
+            if not resolved.get("found"):
+                continue
+            entity = resolved["entity"]
+            for actor in actors.values():
+                if actor.get("name") == name:
+                    actor["entity_id"] = str(entity["entity_id"])
+        return game_state
+
+    def _sync_appearing_characters(
+        self,
+        thread_id: str,
+        game_state: dict[str, Any],
+        turn_no: int,
+    ) -> dict[str, Any]:
+        """上一轮 API 3 新建的角色，下一轮开始时补进状态并绑定实体。"""
+        if self.tools is None or turn_no <= 1:
+            return game_state
+        try:
+            entities = self.tools.characters_created_at(thread_id, turn_no - 1)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "上轮新角色同步失败，跳过",
+                extra={
+                    "event": "state.actors.sync.failed",
+                    "error": str(exc),
+                },
+            )
+            return game_state
+        for entity in entities:
+            name = str(entity.get("canonical_name") or "").strip()
+            if not name:
+                continue
+            ensure_actor(
+                game_state, name, str(entity.get("entity_id") or "")
+            )
+        return game_state
+
     def _state(self, state: ConversationState) -> dict[str, Any]:
         packet = state.get("pre_turn") or {}
         try:
             current = self.game_state.load(state["thread_id"])
+            current = self._sync_appearing_characters(
+                state["thread_id"], current, int(state["turn_no"])
+            )
             resolution = None
             action = packet.get("action") or {}
             if action.get("needs_check"):
@@ -360,6 +435,9 @@ class ConversationGraph:
                     thread_id=state["thread_id"],
                     turn_no=int(state["turn_no"]),
                 )
+            current = self._bind_entities(
+                state["thread_id"], current, [action.get("target")]
+            )
             return {
                 "state_view": state_view(current),
                 "resolution": resolution,
@@ -395,19 +473,61 @@ class ConversationGraph:
             ),
         }
 
+    def _judge(self, state: ConversationState) -> dict[str, Any]:
+        """独立状态裁决：GM 正文之后、写库之前，产出 effects。"""
+        reply = str(state.get("reply") or "").strip()
+        if not reply:
+            return {"effects": [], "appearances": []}
+        recent = self.store.get_recent_turns(
+            state["thread_id"], self.settings.dialogue_history_turns
+        )
+        recent_context = "\n".join(
+            f"[{'玩家' if message['role'] == 'user' else 'GM'}] "
+            f"{message['content']}"
+            for message in recent
+            if message["role"] in ("user", "assistant")
+        )
+        decision = self.state_judge.propose(
+            user_action=state.get("narrative_message") or state["user_message"],
+            reply=reply,
+            state_view=state.get("state_view"),
+            resolution=state.get("resolution"),
+            recent_context=recent_context,
+        )
+        return {
+            "effects": decision.get("effects", []),
+            "appearances": decision.get("appearances", []),
+        }
+
     def _reconcile(self, state: ConversationState) -> dict[str, Any]:
         effects = state.get("effects") or []
+        appearances = state.get("appearances") or []
         state_after = state.get("state_after") or {}
-        if not effects or not state_after:
+        if not state_after:
             return {"applied_effects": [], "effects_rejected": []}
-        blocked = {
-            str(item.get("path"))
-            for item in (state.get("resolution") or {}).get("deltas", [])
-            if item.get("path")
-        }
         try:
-            new_state, applied, rejected = apply_effects(
-                state_after, effects, blocked_paths=blocked
+            for name in appearances:
+                cleaned = str(name or "").strip()
+                if cleaned and cleaned not in ("player", "你", "玩家"):
+                    ensure_actor(state_after, cleaned)
+            applied: list[dict[str, Any]] = []
+            rejected: list[dict[str, Any]] = []
+            if effects:
+                blocked = {
+                    str(item.get("path"))
+                    for item in (state.get("resolution") or {}).get("deltas", [])
+                    if item.get("path")
+                }
+                state_after, applied, rejected = apply_effects(
+                    state_after, effects, blocked_paths=blocked
+                )
+            names = (
+                [effect.get("target") for effect in effects]
+                + [((state.get("resolution") or {}).get("action") or {}).get("target")]
+                + list(appearances)
+            )
+            new_state = self._bind_entities(
+                state["thread_id"], state_after, names
             )
             logger.info(
                 "剧情后果结算完成",
@@ -415,6 +535,7 @@ class ConversationGraph:
                     "event": "state.reconcile.done",
                     "applied": len(applied),
                     "rejected": len(rejected),
+                    "appearances": len(appearances),
                 },
             )
             return {

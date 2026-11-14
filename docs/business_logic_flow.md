@@ -30,15 +30,16 @@ flowchart TD
         EXP --> RR["bge-reranker 精排<br/>实体 0.6 / 上下文 0.4"]
         CR --> RR
         RR --> STATE["state 节点<br/>读 game_states<br/>attack 检定 / 时间 / 状态"]
-        STATE --> GM["GM 五段提示词<br/>核心规则 + 本轮契约 + 玩家自定义<br/>+ 世界书 + 记忆<br/>状态卡 + 本轮结算"]
-        GM --> RECON["reconcile<br/>GM effects 校验<br/>HP / 标签 / flag / 时间"]
+        STATE --> GM["GM 五段提示词<br/>核心规则 + 本轮契约 + 玩家自定义<br/>+ 世界书 + 记忆<br/>状态卡 + 本轮结算<br/>只输出正文"]
+        GM --> JUDGE["judge：状态裁决 LLM<br/>正文 → effects<br/>失败降级为空"]
+        JUDGE --> RECON["reconcile<br/>effects 校验<br/>HP / 标签 / flag / 时间"]
         RECON --> PERSIST["persist<br/>消息 + state_events + game_states"]
     end
 
     PERSIST --> REPLY["返回玩家"]
     PERSIST --> BG
 
-    subgraph BG["后台任务（BackgroundTasks，ingest_lock 串行）"]
+    subgraph BG["后台任务（PG background_tasks + worker 串行）"]
         API3["API3 实体/属性/关系固化"]
         ING["5 轮增量向量入库"]
         PLOTM["主线维护<br/>L0 归档 / L1 / L2"]
@@ -116,9 +117,10 @@ flowchart LR
 - **输入分流**：`narrative / meta / mixed`；纯 meta 不落消息、不计 turn；mixed 只把叙事部分送入 GM。
 - **API2**：单轮总结 + 查询改写与实体假设两路并行。
 - **三条召回**：实体路（关键词 + 向量 + 图扩展）、上下文路（子块 → 父块）、主线路（L2 常驻 + L1 章节）；自定义世界书和提示词由前端随请求携带，不落库。
-- **GM**：五段提示词 + 隐藏 `plan`；只返回 `reply`。
+- **GM**：五段提示词，只写故事正文。
+- **状态裁决**：GM 正文后独立调用一次 LLM（`state_judge.md`）产出 `effects`，引擎校验后写回；失败只降级为空。
 - **状态与时间**：GM 根据剧情输出 `hp_delta/tag/flag/scale/time_advance`，引擎校验后写 `game_states`；时间按规则包历法推进，和 HP 一样由工具层修改。
 - **关系**：`relation_label` 是自由短语，不做枚举；同一对实体的不同标签是不同边；重要约定/事件做成 event 实体。
 - **主线生命周期**：L0 每轮一次，5 轮内 active，离开窗口后归档并向量化；L1 每 5 条 L0 合并；L2 每个新章节递归合并。
 - **回退**：消息标记 `rolled_back`，物理删除 chunks/entity_index/mentions/traces/plot_nodes/state_events 和 Neo4j 对应实体/关系；checkpoint 只用于对话状态。
-- **后台任务**：API3、5 轮入库、主线维护都走 `BackgroundTasks`，当前不可持久化。
+- **后台任务**：API3、5 轮入库、主线维护、世界导入都写入 `background_tasks` 表，由单 worker 串行消费；失败退避重试，重启续跑。

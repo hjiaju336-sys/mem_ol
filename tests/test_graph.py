@@ -53,6 +53,11 @@ class FakePreTurn:
         }
 
 
+class FakeJudge:
+    def propose(self, **kwargs):
+        return {"effects": [], "appearances": []}
+
+
 class FakeDialogue:
     def generate(
         self,
@@ -89,6 +94,7 @@ def test_graph_turns_increment_and_checkpoint_is_written():
         checkpointer=MemorySaver(),
         pre_turn_service=FakePreTurn(),
         dialogue_engine=FakeDialogue(),
+        state_judge=FakeJudge(),
     )
 
     first = graph.run("thread-1", "hello")
@@ -113,6 +119,7 @@ def test_meta_instruction_does_not_consume_turn_or_checkpoint():
         checkpointer=MemorySaver(),
         pre_turn_service=FakeMetaPreTurn(),
         dialogue_engine=FakeDialogue(),
+        state_judge=FakeJudge(),
     )
 
     result = graph.run("thread-1", "写短点")
@@ -123,3 +130,52 @@ def test_meta_instruction_does_not_consume_turn_or_checkpoint():
     assert result["message_ids"] == []
     assert store.turn == 0
     assert store.checkpoints == []
+
+
+class FakeEntityTools:
+    def entity_resolve(self, thread_id, name):
+        if name == "守卫":
+            return {"found": True, "entity": {"entity_id": "e-guard"}}
+        return {"found": False, "entity": None}
+
+    def characters_created_at(self, thread_id, turn_no):
+        if turn_no == 2:
+            return [
+                {
+                    "entity_id": "e-yaolao",
+                    "canonical_name": "药老",
+                    "entity_type": "character",
+                }
+            ]
+        return []
+
+
+def test_sync_appearing_characters_adds_actor_and_binds_entity():
+    graph = ConversationGraph.__new__(ConversationGraph)
+    graph.tools = FakeEntityTools()
+    state = {"actors": {"player": {"name": "玩家"}}}
+    graph._sync_appearing_characters("thread-1", state, 3)
+    assert state["actors"]["npc:药老"]["entity_id"] == "e-yaolao"
+
+
+def test_bind_entities_attaches_entity_id_by_name():
+    graph = ConversationGraph.__new__(ConversationGraph)
+    graph.tools = FakeEntityTools()
+    state = {"actors": {"player": {"name": "玩家"}, "npc:守卫": {"name": "守卫"}}}
+    graph._bind_entities("thread-1", state, ["守卫", "路人", None])
+    assert state["actors"]["npc:守卫"]["entity_id"] == "e-guard"
+    assert "entity_id" not in state["actors"]["player"]
+
+
+def test_reconcile_creates_actors_for_appearances():
+    graph = ConversationGraph.__new__(ConversationGraph)
+    graph.tools = FakeEntityTools()
+    out = graph._reconcile(
+        {
+            "thread_id": "thread-1",
+            "appearances": ["药老"],
+            "effects": [],
+            "state_after": {"actors": {"player": {"name": "玩家"}}},
+        }
+    )
+    assert out["state_after"]["actors"]["npc:药老"]["name"] == "药老"

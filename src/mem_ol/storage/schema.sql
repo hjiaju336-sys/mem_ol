@@ -268,3 +268,24 @@ CREATE TABLE IF NOT EXISTS tool_call_logs (
 
 CREATE INDEX IF NOT EXISTS idx_tool_call_logs_trace
     ON tool_call_logs (trace_id, created_at);
+
+-- 后台任务队列：graph 返回后的实体固化、入库、主线维护、世界导入
+CREATE TABLE IF NOT EXISTS background_tasks (
+    id uuid PRIMARY KEY,
+    thread_id uuid NOT NULL,
+    kind text NOT NULL
+        CHECK (kind IN ('commit', 'ingest', 'plot', 'world_import', 'worldview')),
+    dedupe_key text NOT NULL,
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+    status text NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'done', 'failed')),
+    attempts integer NOT NULL DEFAULT 0,
+    next_run_at timestamptz NOT NULL DEFAULT now(),
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (thread_id, kind, dedupe_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_background_tasks_ready
+    ON background_tasks (status, next_run_at);

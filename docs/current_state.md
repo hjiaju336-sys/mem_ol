@@ -19,7 +19,9 @@
 - 记忆探针：8/10 完整、2/10 部分；
 - 路由：16 题任一路 @5 = 1.0；20 轮中上下文 9/10、实体 10/10、主线 9/10；
 - 回退、长程召回、时间推进均通过；
-- 79 个测试通过。
+- 跨题材迁移：玄幻（斗破 10k 字，14 轮）、现实（儒林外史 49k 字，5 轮）、西幻（原创，5 轮）均跑通，角色登场即绑定实体；
+- 后台任务：PG `background_tasks` + worker，崩溃恢复、失败退避、正常一轮均验证；
+- 94 个测试通过。
 
 细节见 `docs/eval_glm_2026-11-14.md`、`docs/eval_v2_2026-11-13.md`。
 
@@ -62,11 +64,13 @@
   state：读 game_states；attack 时引擎掷骰/伤害，产出 Resolution
   ↓
   GM 五段拼装：核心规则 + 响应契约 + 玩家自定义 + 世界书 + 记忆
-     + 当前状态卡（含历法时间）+ 本轮结算（数值权威）
+     + 当前状态卡（含历法时间）+ 本轮结算（数值权威）；只输出正文
   ↓
-  reconcile：GM effects（标签/数值/flag/时间）经引擎校验后写回状态
+  judge：独立状态裁决 LLM 读玩家输入 + 正文 + 状态卡 + 结算，输出 effects
+  ↓
+  reconcile：effects（标签/数值/flag/时间）经引擎校验后写回状态
      （重复结算 HP 会被拒绝）
-  ↓ 隐藏 plan 自检，只返回 reply
+  ↓
   persist：消息落库、L0 摘要入 plot_nodes
   ↓
   后台：API3 实体固化、5 轮入库、plot 维护（归档/章节/全局）
@@ -85,7 +89,7 @@
 - **meta**：纯元指令不生成正文、不落消息、不计 turn；前端保存为 `pending_instructions`，下次叙事请求静默生效。OOC 问题走 `gm_meta.md`，回答只进系统回答区。
 - **mixed**：拆出 `narrative_query` 走故事流程，`directives` 作为本轮生成参数。
 - **GM 提示词五段**：`gm_core.md` → `gm_contracts.md`（按 intent）→ 玩家自定义 → 世界书命中条目 → 记忆；最后一条 user 消息附本轮生成要求。
-- **隐藏 plan**：GM 返回 `{"plan": {...}, "reply": "..."}`，代码只使用 `reply`，`plan` 仅记日志。
+- **状态裁决**：GM 只写正文；`services/state_judge.py` 在正文之后独立调用一次 LLM，按 `prompts/state_judge.md` 输出 `effects` 和本轮登场的 `appearances`，引擎校验后写回；登场角色会建立状态 actor 并绑定 Neo4j 实体。裁决失败只记日志，不影响正文与落库。
 - **世界书**：兼容 SillyTavern 原生和 Character Card V2；`lorebook.py` 做解析/触发/渲染；`ClientContext` 随请求携带，不进数据库、不进 checkpoint。
 - **持久化边界**：自定义提示词、世界书、pending instructions 都是前端内容；服务端只在本次请求内使用。
 
@@ -145,7 +149,7 @@ LOREBOOK_RECURSION_STEPS=0
 - `domain/enums.py`：channel/intent/action/effect 等闭集。
 - `domain/rules.py` + `rules/default.json`：默认角色/武器、检定基础值、效果上限；按 mtime 热加载，支持 `MEM_OL_RULES_PATH`。
 - `api/schemas.py`：HTTP 请求与客户端上下文模型。
-- `prompts/gm_output.md`：GM JSON 输出格式与 effects 约束，改提示词不用改代码。
+- `prompts/state_judge.md`：状态裁决的 effects 约束，改提示词不用改代码。
 - `scripts/validate_assets.py`：校验规则包与所有提示词文件，改配置后先跑一遍。
 - 关系：Neo4j `:REL` 存 `relation_label` 自由短语（不做粗分类枚举）；`rel_id` 含标签，同一对实体不同关系可并存；`relation_label_fulltext` 支持按关系模糊查询。
 - `mcp_server/` 只保留工具实现与 server，不再存放共享 schema。
@@ -155,10 +159,11 @@ LOREBOOK_RECURSION_STEPS=0
 - PostgreSQL：消息、批次、chunks、entity_index、mentions、traces、plot_nodes、tool logs、checkpoint；
 - Neo4j：`:Entity`、`:AttributeChange`（append-only）、`:REL`；
 - 实体权威在 Neo4j；PG entity_index 是派生索引；
+- 角色状态 `game_states.actors` 通过 `entity_id` 绑定 Neo4j 实体（精确规范名/别名匹配）；数值仍只存 game_states，不写 Neo4j；
 - 属性当前值按 `source_order`：对话 `turn_no*1000`，世界导入 `batch_seq*1e6+窗口*1000`；
 - `rel_id` 由线程 + 两端实体 + 类型决定，重复提交不新增边；
 - 回退：mark messages rolled_back + 物理删除 chunks/entity_index/mentions/traces/plot_nodes + Neo4j 删除；
-- 后台任务仍是 FastAPI `BackgroundTasks` + `ingest_lock`，服务重启会丢；
+- 后台任务已迁到 PostgreSQL `background_tasks` 表 + worker（`FOR UPDATE SKIP LOCKED`、失败退避重试、启动回收 `running`），服务重启不丢；
 - 无多租户/鉴权；无正式评测集。
 
 ## 清理记录
@@ -168,4 +173,4 @@ LOREBOOK_RECURSION_STEPS=0
 - 删除生成的测试文本：`doupo_{2000,5000,10000,append_2k,smoke}.txt`、`rulin_{20000,150000}.txt`、`xiyouji_001_raw.txt`；保留 `doupo_excerpt.txt`、`rulin_raw.txt`、`rulin_001_002.txt`、`xiyouji_001.txt`；
 - 清空 PostgreSQL / Neo4j 中所有测试会话与数据；
 - 删除 `.playwright-mcp`、`.pytest_cache`、`__pycache__`、历史日志；
-- 当前测试：`79 passed`。
+- 当前测试：`94 passed`。

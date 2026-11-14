@@ -36,8 +36,9 @@ flowchart TD
     CR --> RR
     PL --> RR
     RR --> ST[state<br/>读 game_states<br/>attack 检定 / 时间 / 状态]
-    ST --> GM[generate<br/>五段提示词 + 状态卡 + 结算<br/>隐藏 plan，只返回 reply]
-    GM --> RC[reconcile<br/>GM effects 校验<br/>HP / 标签 / flag / 时间]
+    ST --> GM[generate<br/>五段提示词 + 状态卡 + 结算<br/>只输出正文]
+    GM --> JD[judge<br/>独立状态裁决 LLM<br/>正文 → effects]
+    JD --> RC[reconcile<br/>effects 校验<br/>HP / 标签 / flag / 时间]
     RC --> PS[persist<br/>消息 + state_events + game_states]
     PS --> PG[(PostgreSQL)]
     PS --> BG1[后台 API 3<br/>实体/关系固化]
@@ -169,29 +170,39 @@ sequenceDiagram
   - 世界书命中条目（before/after 两段，前端携带，不落库）；
   - 记忆：主线、精排后的实体 top6、上下文父块 top4、多跳关系路径。
 - 最后一条 user 消息追加本轮生成要求：契约、`directives`、`pending_instructions`、上一轮承接摘要；要求正文不得确认或复述这些要求。
-- GM 先输出隐藏的 `plan`（intent/expected_outcome/continuity/state_change），代码只取 `reply`；`plan` 仅记日志。
-- 调用 LLM 生成 GM 回复；不在本节点落库。
+- GM 只输出故事正文；调用 LLM 生成回复，不在本节点落库。
 
-### 3.4 persist
+### 3.4 judge（状态裁决）
+
+- GM 正文之后独立调用一次 LLM（`prompts/state_judge.md`）。
+- 输入：玩家本轮输入、GM 正文、当前状态卡、本轮结算、最近对话。
+- 输出：`{"effects": [...], "appearances": [...]}`，只提出正文中新产生且结算未覆盖的后果。
+- `appearances` 是本轮登场的角色：reconcile 为其建立状态 actor，并按规范名/别名绑定到 Neo4j 实体；API 3 之后新建的角色在下一轮开始时补建状态。
+- 失败或超时返回空 decisions，不影响正文与落库。
+
+### 3.5 persist
 
 - 写入 user + assistant 两条消息，同一 `turn_no`。
 - 计算 `pending_turns = 未入库完整轮次数`。
 - `ingest_required = pending_turns >= 5`。
 - 图结束后取最终 checkpoint_id，回写这一轮消息的 `checkpoint_id`。
 
-### 3.5 后台触发
+### 3.6 后台触发
 
-当前**不是图内 hook，也不是定时轮询**：
+不是图内 hook，而是 **PostgreSQL 任务表 + worker 轮询**：
 
 ```text
 graph.run() 返回后，FastAPI 路由检查最终 state：
-  commit_required  → BackgroundTasks(_run_commit)   # API 3，每轮
-  ingest_required  → BackgroundTasks(_run_ingest)   # 5 轮入库
+  commit_required  → background_tasks(kind=commit, dedupe=turn:N)   # API 3，每轮
+  ingest_required  → background_tasks(kind=ingest, dedupe=turn:N)   # 5 轮入库
+  每轮              → background_tasks(kind=plot,   dedupe=turn:N)   # 主线维护
 ```
 
-- `BackgroundTasks` 在响应发送后执行，同进程；进程重启会丢失。
+- 入队在响应前完成，任务落 PostgreSQL；进程重启不丢。
+- `services/task_worker.py` 在 FastAPI lifespan 启动，串行领取任务（`FOR UPDATE SKIP LOCKED`），执行成功置 `done`；失败按 `5s/10s/20s/40s` 退避重试，5 次后置 `failed` 并保留 `last_error`。
+- 启动时把上次遗留的 `running` 任务重置为 `pending`，自然续跑。
+- 世界导入/世界观入库也走同一队列（`world_import` / `worldview`）。
 - `POST /api/threads/{id}/ingest` 可手动补偿入库。
-- API 3 当前没有自动重试；失败只记日志。
 
 ## 4. API 3 实体/关系固化
 
@@ -321,14 +332,18 @@ MCP server 通过 `scripts/run_mcp_server.py` 独立暴露，默认 `127.0.0.1:8
 - API 2 两路并行（单轮总结+改写 / 实体假设）
 - 三层主线摘要（L0 单轮 / L1 章节 / L2 全局）
 - API 3 实体/属性/关系固化，MCP `entity_commit_plan`
+- 独立状态裁决（`state_judge`）：正文 → effects/appearances，登场角色绑定实体
+- 后台任务 PG 队列 + worker：崩溃恢复、失败退避重试、世界导入复用同一队列
+- 重复实体手动合并脚本（`scripts/merge_duplicate_entities.py`）
+- 三套世界观的迁移测试（玄幻 / 现实 / 西幻）
 - checkpoint 保留 5 轮
-- 79 个测试
+- 94 个测试
 
 **当前边界：**
 
-- 后台任务仍是 FastAPI BackgroundTasks，服务重启会丢任务
+- 后台任务是单 worker 串行；多实例部署时需要按 `thread_id` 加锁或分片，长任务会阻塞后续任务
 - 无多租户/JWT
 - 没有正式评测集（Recall/MRR/主线忠实度）
-- 跨轮实体合并依赖整理 agent / API3 模型判断
+- 重复实体合并是手动脚本，未做定时任务；别名近义（如「萧熏儿」「萧薰儿」）依赖 API3 写入 aliases
 - 精排仍在 CPU
 - 状态管道（情绪/场景滚动状态）未实现

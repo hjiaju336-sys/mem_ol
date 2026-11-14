@@ -32,13 +32,13 @@ def test_gm_core_and_contracts_load():
     assert "必须出现" in contracts["action"]
 
 
-def test_gm_output_prompt_contains_effect_schema():
-    text = load_system_prompt("gm_output.md")
+def test_state_judge_prompt_contains_effect_schema():
+    text = load_system_prompt("state_judge.md")
     assert "effects" in text
-    assert "reply" in text
     assert "hp_delta" in text
     assert "time_advance" in text
     assert "重复" in text
+    assert "不写故事" in text
 
 
 def test_gm_meta_prompt_renders():

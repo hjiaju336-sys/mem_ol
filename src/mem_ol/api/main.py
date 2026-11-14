@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import threading
 from contextlib import ExitStack, asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,7 +11,9 @@ from mem_ol.graph.conversation import ConversationGraph
 from mem_ol.log import get_logger, setup_logging
 from mem_ol.mcp_server.tools import close_tool_service, get_tool_service
 from mem_ol.services.embedding import get_embedding_service
+from mem_ol.services.llm import get_llm_service
 from mem_ol.services.rerank import get_rerank_service
+from mem_ol.services.task_worker import BackgroundWorker
 
 logger = get_logger(__name__)
 
@@ -26,7 +27,6 @@ async def lifespan(app: FastAPI):
         app.state.tool_service = tool_service
         app.state.store = tool_service.store
         app.state.settings = tool_service.settings
-        app.state.ingest_lock = threading.Lock()
 
         checkpointer = stack.enter_context(
             PostgresSaver.from_conn_string(settings.postgres_dsn)
@@ -55,9 +55,25 @@ async def lifespan(app: FastAPI):
                     exc_info=True,
                 )
 
+        recovered = tool_service.store.reset_running_background_tasks()
+        if recovered:
+            logger.info(
+                "回收上次未完成的后台任务",
+                extra={"event": "background.worker.recovered", "count": recovered},
+            )
+        worker = BackgroundWorker(
+            tool_service.store,
+            tool_service,
+            get_llm_service(),
+            settings,
+        )
+        await worker.start()
+        app.state.worker = worker
+
         try:
             yield
         finally:
+            await worker.stop()
             close_tool_service()
 
 

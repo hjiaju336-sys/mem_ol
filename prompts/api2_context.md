@@ -64,7 +64,7 @@
 
 - 只对叙事部分填写；纯 meta、询问剧情、普通对话可以填 `kind=other`。
 - `kind` 允许值：`attack/defend/move/investigate/social/cultivate/use_item/other`。
-- `target` 填玩家明确指向的对象名；没有就留空。
+- `target` 填玩家明确指向的对象名；指玩家自己时填 `player`；没有就留空。
 - `approach` 简述玩家打算怎么做，不超过 50 字。
 - `needs_check`：只有存在明确失败风险、且可能改变数值/状态时才填 `true`；普通对话、观察、询问填 `false`。
 - 不要填写 DC、伤害、骰子、成功率等数值，这些由引擎决定。

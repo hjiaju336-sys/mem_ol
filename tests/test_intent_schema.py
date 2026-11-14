@@ -37,3 +37,26 @@ def test_none_fields_are_tolerated():
 def test_directive_empty():
     assert TurnDirective().is_empty()
     assert not TurnDirective(length="short").is_empty()
+
+
+def test_overlong_ap2_text_is_clipped_not_rejected():
+    # 超长不能整份失败，否则分流会降级成叙事，纯 meta 被落库。
+    result = AP2ContextResult(
+        channel="meta",
+        context_summary="概" * 500,
+        rewritten_query="改" * 1200,
+        narrative_query="叙" * 2000,
+        meta_question="问" * 1200,
+    )
+    assert result.channel == "meta"
+    assert len(result.context_summary) == 300
+    assert len(result.rewritten_query) == 800
+    assert len(result.narrative_query) == 1200
+    assert len(result.meta_question) == 800
+
+
+def test_overlong_entities_are_clipped():
+    from mem_ol.domain import AP2EntitiesResult
+
+    result = AP2EntitiesResult(entities=[f"词{i}" for i in range(20)])
+    assert len(result.entities) == 12

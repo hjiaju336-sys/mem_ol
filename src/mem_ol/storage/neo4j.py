@@ -193,8 +193,10 @@ class Neo4jStore:
         YIELD relationship, score
         WHERE startNode(relationship).thread_id = $thread_id
           AND endNode(relationship).thread_id = $thread_id
-        RETURN startNode(relationship).canonical_name AS source_name,
+        RETURN startNode(relationship).entity_id AS source_id,
+               startNode(relationship).canonical_name AS source_name,
                coalesce(relationship.relation_label, '') AS relation_label,
+               endNode(relationship).entity_id AS target_id,
                endNode(relationship).canonical_name AS target_name,
                score
         ORDER BY score DESC
@@ -225,8 +227,10 @@ class Neo4jStore:
         MATCH (s:Entity {thread_id: $thread_id})-[r:REL]->(t:Entity {thread_id: $thread_id})
         WHERE any(k IN $keywords
                   WHERE r.relation_label CONTAINS k)
-        RETURN s.canonical_name AS source_name,
+        RETURN s.entity_id AS source_id,
+               s.canonical_name AS source_name,
                r.relation_label AS relation_label,
+               t.entity_id AS target_id,
                t.canonical_name AS target_name,
                0.5 AS score
         LIMIT $limit
@@ -239,6 +243,49 @@ class Neo4jStore:
                 limit=int(limit),
             ).data()
         return _jsonable(rows)
+
+    def list_characters_created_at(
+        self, thread_id: uuid.UUID | str, turn_no: int
+    ) -> list[dict[str, Any]]:
+        """某轮 API 3 新建的角色实体；用于把状态角色补进 game_states。"""
+        with self.driver.session() as session:
+            rows = session.run(
+                """
+                MATCH (e:Entity {thread_id: $thread_id})
+                WHERE e.entity_type = 'character'
+                  AND coalesce(e.created_turn_no, 0) = $turn_no
+                RETURN e.entity_id AS entity_id,
+                       e.canonical_name AS canonical_name,
+                       e.entity_type AS entity_type
+                LIMIT 50
+                """,
+                thread_id=str(thread_id),
+                turn_no=int(turn_no),
+            ).data()
+        return _jsonable(rows)
+
+    def find_entity_by_name(
+        self, thread_id: uuid.UUID | str, name: str
+    ) -> dict[str, Any] | None:
+        """按规范名或别名精确匹配；只用于把状态挂到实体，不做模糊绑定。"""
+        cleaned = (name or "").strip()
+        if not cleaned:
+            return None
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (e:Entity {thread_id: $thread_id})
+                WHERE e.canonical_name = $name
+                   OR $name IN coalesce(e.aliases, [])
+                RETURN e.entity_id AS entity_id,
+                       e.canonical_name AS canonical_name,
+                       e.entity_type AS entity_type
+                LIMIT 1
+                """,
+                thread_id=str(thread_id),
+                name=cleaned,
+            ).single()
+        return _jsonable(dict(record)) if record else None
 
     def get_entity(
         self,
@@ -619,3 +666,162 @@ class Neo4jStore:
 
         with self.driver.session() as session:
             return session.execute_write(_write)
+
+    def list_entities(self, thread_id: uuid.UUID | str) -> list[dict[str, Any]]:
+        """线程内全部实体的轻量视图，供去重维护使用。"""
+        with self.driver.session() as session:
+            rows = session.run(
+                """
+                MATCH (e:Entity {thread_id: $thread_id})
+                RETURN e.entity_id AS entity_id,
+                       e.canonical_name AS canonical_name,
+                       e.entity_type AS entity_type,
+                       coalesce(e.aliases, []) AS aliases,
+                       coalesce(e.summary, '') AS summary,
+                       coalesce(e.created_turn_no, 0) AS created_turn_no
+                ORDER BY created_turn_no, canonical_name
+                """,
+                thread_id=str(thread_id),
+            ).data()
+        return _jsonable(rows)
+
+    def merge_entities(
+        self,
+        thread_id: uuid.UUID | str,
+        survivor_id: uuid.UUID | str,
+        duplicate_ids: Sequence[uuid.UUID | str],
+    ) -> dict[str, Any]:
+        """把重复实体并入 survivor：别名、属性、关系重新挂接后删除重复节点。"""
+        tid = str(thread_id)
+        sid = str(survivor_id)
+        aliases: list[str] = []
+        merged = 0
+        moved_attributes = 0
+        moved_relations = 0
+
+        def _add_names(name: Any, alias_values: Sequence[Any]) -> None:
+            for value in [name, *alias_values]:
+                text = str(value or "").strip()
+                if text and text not in aliases:
+                    aliases.append(text)
+
+        with self.driver.session() as session:
+            record = session.run(
+                "MATCH (e:Entity {entity_id: $entity_id, thread_id: $thread_id}) "
+                "RETURN e",
+                entity_id=sid,
+                thread_id=tid,
+            ).single()
+            if record is None:
+                raise ValueError(f"survivor 不存在: {survivor_id}")
+            survivor = dict(record["e"])
+            _add_names(
+                survivor.get("canonical_name"), survivor.get("aliases") or []
+            )
+
+            for dup_value in duplicate_ids:
+                dup_id = str(dup_value)
+                record = session.run(
+                    "MATCH (e:Entity {entity_id: $entity_id, thread_id: $thread_id}) "
+                    "RETURN e",
+                    entity_id=dup_id,
+                    thread_id=tid,
+                ).single()
+                if record is None:
+                    continue
+                dup = dict(record["e"])
+                _add_names(dup.get("canonical_name"), dup.get("aliases") or [])
+                merged += 1
+
+                moved_attributes += int(
+                    session.run(
+                        """
+                        MATCH (d:Entity {entity_id: $dup_id, thread_id: $thread_id})
+                              -[r:HAS_ATTRIBUTE]->(a:AttributeChange)
+                        MATCH (s:Entity {entity_id: $survivor_id, thread_id: $thread_id})
+                        MERGE (s)-[:HAS_ATTRIBUTE]->(a)
+                        DELETE r
+                        RETURN count(a) AS moved
+                        """,
+                        dup_id=dup_id,
+                        survivor_id=sid,
+                        thread_id=tid,
+                    ).single()["moved"]
+                )
+
+                for direction in ("out", "in"):
+                    if direction == "out":
+                        query = """
+                        MATCH (d:Entity {entity_id: $dup_id, thread_id: $thread_id})
+                              -[r:REL]->(t:Entity {thread_id: $thread_id})
+                        RETURN t.entity_id AS other_id,
+                               r.relation_label AS relation_label,
+                               coalesce(r.source_order, 0) AS source_order
+                        """
+                    else:
+                        query = """
+                        MATCH (t:Entity {thread_id: $thread_id})
+                              -[r:REL]->(d:Entity {entity_id: $dup_id, thread_id: $thread_id})
+                        RETURN t.entity_id AS other_id,
+                               r.relation_label AS relation_label,
+                               coalesce(r.source_order, 0) AS source_order
+                        """
+                    edges = session.run(
+                        query, dup_id=dup_id, thread_id=tid
+                    ).data()
+                    for edge in edges:
+                        other_id = str(edge["other_id"])
+                        if other_id == sid:
+                            continue
+                        label = str(edge["relation_label"] or "未明确")
+                        source, target = (
+                            (sid, other_id)
+                            if direction == "out"
+                            else (other_id, sid)
+                        )
+                        rel_id = str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"{tid}:rel:{source}:{target}:{label}",
+                            )
+                        )
+                        session.run(
+                            """
+                            MATCH (s:Entity {entity_id: $source_id, thread_id: $thread_id})
+                            MATCH (t:Entity {entity_id: $target_id, thread_id: $thread_id})
+                            MERGE (s)-[r:REL {rel_id: $rel_id}]->(t)
+                            ON CREATE SET r.relation_label = $label,
+                                          r.thread_id = $thread_id,
+                                          r.source_order = $source_order
+                            """,
+                            source_id=source,
+                            target_id=target,
+                            rel_id=rel_id,
+                            label=label,
+                            source_order=int(edge.get("source_order") or 0),
+                            thread_id=tid,
+                        ).consume()
+                        moved_relations += 1
+
+                session.run(
+                    "MATCH (d:Entity {entity_id: $dup_id, thread_id: $thread_id}) "
+                    "DETACH DELETE d",
+                    dup_id=dup_id,
+                    thread_id=tid,
+                ).consume()
+
+            session.run(
+                "MATCH (e:Entity {entity_id: $survivor_id, thread_id: $thread_id}) "
+                "SET e.aliases = $aliases",
+                survivor_id=sid,
+                thread_id=tid,
+                aliases=aliases,
+            ).consume()
+
+        return {
+            "survivor_id": sid,
+            "aliases": aliases,
+            "merged_entities": merged,
+            "moved_attributes": moved_attributes,
+            "moved_relations": moved_relations,
+        }
