@@ -194,7 +194,6 @@ mem_ol/
 │   ├── validate_assets.py        # 校验规则包与提示词
 │   ├── prepare_worldview.py      # 清理 Wiki 文本
 │   ├── seed_worldview.py         # 导入世界：向量化 + 实体初始化
-│   ├── merge_duplicate_entities.py  # 合并同线程重复实体（dry-run/--apply）
 │   ├── eval_memory.py            # 世界检索 + 实体双路评测
 │   ├── eval_dialogue_memory.py   # 5 轮增量对话记忆评测
 │   ├── eval_suite.py             # 分类型套件：事实/别名/关系/指代/时间/窗口外
@@ -386,8 +385,8 @@ MCP：
 - checkpoint 默认只保留最近 5 轮（`CHECKPOINT_RETENTION_TURNS=5`）：旧轮 checkpoint、writes、未被引用的 blobs 会被清理，旧消息的 `checkpoint_id` 置空。
 - LLM JSON 已增加截断检测（`finish_reason=length` 提高 token 重试）、`json-repair` 修复和更严格的提示词；仍可能失败，但日志会记录 `finish_reason` 与响应长度。
 - API 2/3 的确定性读取与召回通过 in-process 服务方法调用；MCP server 目前只暴露 `entity_commit_plan` 写工具，HTTP MCP client 适配层尚未接入。
-- 实体匹配阈值暂定 0.75；世界导入的重复实体由整理 agent 合并，API3 跨轮合并仍依赖候选与模型判断。
-- 回退与指代解析已接入；后台任务已持久化（PG 队列 + worker）；重复实体有手动合并脚本；状态管道（情绪/场景滚动状态）与 REINDEX 维护尚未实现。
+- 实体匹配阈值暂定 0.75；世界导入的重复实体由整理 agent 合并。
+- 回退与指代解析已接入；后台任务已持久化（PG 队列 + worker）。多租户/鉴权与正式评测集属于产品化边界。
 - CPU embedding 较慢（约 40~60 秒 / 万字符），入库已放到后台任务。
 - 《西游记》属于 LLM 常识，只能验证链路；验收记忆效果需换私有/合成世界观文本。
 - 无认证与多租户，当前按线程隔离。

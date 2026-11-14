@@ -74,7 +74,7 @@ pytest
 - checkpoint 保留：`checkpoint_retention_turns=5`；每轮结束后清理旧轮 checkpoints/writes/blobs，并置空旧消息的 checkpoint_id。
 - LLM JSON：`finish_reason=length` 时提高 max_tokens 重试；解析失败用 `json_repair` 修复；提示词约束单行字符串/禁用未转义双引号。API2/API3/GM/开场白统一 `dialogue_timeout=120s`；429/5xx 在 `LLMService._create` 内退避重试 3 次（5s/10s）；`chat_json_model(model_cls, ...)` 做 pydantic 结构校验，失败时把错误回传模型重试一次。
 - 回退：`services/rollback.py`，按 turn 级 provenance 物理删除 PostgreSQL chunks/entity_index/mentions/traces 与 Neo4j 实体/关系，checkpoint 只用于对话状态，不能替代数据库回退。
-- 尚未实现：定时实体合并（有手动脚本 `scripts/merge_duplicate_entities.py`）、REINDEX/维护计数后台任务、状态管道（情绪/场景滚动状态）。
+- 状态与数值由 `services/numeric_engine.py` + `game_states` 统一承载（HP/攻防/tags/scales/flags/时间），属于可迁移的“工具与状态引擎”层。
 
 ## 实体记忆（已实现）
 

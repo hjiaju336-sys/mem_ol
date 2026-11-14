@@ -334,16 +334,13 @@ MCP server 通过 `scripts/run_mcp_server.py` 独立暴露，默认 `127.0.0.1:8
 - API 3 实体/属性/关系固化，MCP `entity_commit_plan`
 - 独立状态裁决（`state_judge`）：正文 → effects/appearances，登场角色绑定实体
 - 后台任务 PG 队列 + worker：崩溃恢复、失败退避重试、世界导入复用同一队列
-- 重复实体手动合并脚本（`scripts/merge_duplicate_entities.py`）
 - 三套世界观的迁移测试（玄幻 / 现实 / 西幻）
 - checkpoint 保留 5 轮
 - 94 个测试
 
 **当前边界：**
 
-- 后台任务是单 worker 串行；多实例部署时需要按 `thread_id` 加锁或分片，长任务会阻塞后续任务
+- 后台任务是单 worker 串行
 - 无多租户/JWT
 - 没有正式评测集（Recall/MRR/主线忠实度）
-- 重复实体合并是手动脚本，未做定时任务；别名近义（如「萧熏儿」「萧薰儿」）依赖 API3 写入 aliases
 - 精排仍在 CPU
-- 状态管道（情绪/场景滚动状态）未实现
