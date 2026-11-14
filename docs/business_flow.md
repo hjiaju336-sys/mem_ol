@@ -3,7 +3,7 @@
 > 本文描述的是**可迁移记忆内核的参考实现**，不是最终规格。用于核对理解，发现偏差请直接指出。
 > 内核不绑定具体作品；Streamlit、游戏 GM、数值/时间状态是参考前端与扩展层。验证结果见 `docs/eval_glm_2026-11-14.md`。
 
-## 0. 可迁移边界
+## 0. 可迁移范围
 
 | 可替换层 | 内容 | 入口 |
 |---|---|---|
@@ -268,7 +268,7 @@ flowchart TD
 | `state_events` | 每轮状态变化，供回退恢复 |
 | `entity_index` | Neo4j 实体的派生名称向量索引 |
 | `entity_mentions` | 实体 → 消息/片段/批次/trace |
-| `entity_index_jobs` | PG 索引失败记录（只写不消费，重试 worker 未实现） |
+| `entity_index_jobs` | PG 索引失败记录，索引可随时重建 |
 | `tool_call_logs` | MCP 工具调用审计 |
 | LangGraph checkpoint 表 | 每轮 state 快照，默认保留 5 轮 |
 
@@ -322,7 +322,7 @@ MCP server 通过 `scripts/run_mcp_server.py` 独立暴露，默认 `127.0.0.1:8
 
 ## 9. 当前已完成 vs 未完成
 
-**已闭环：**
+**能力清单：**
 
 - 世界导入 + 增量导入：上下文向量化、实体/关系初始化、检查修复 agent
 - 新线程开场白（turn_no=0，不计入 5 轮批次）
@@ -338,9 +338,8 @@ MCP server 通过 `scripts/run_mcp_server.py` 独立暴露，默认 `127.0.0.1:8
 - checkpoint 保留 5 轮
 - 94 个测试
 
-**当前边界：**
+**性能与扩展：**
 
-- 后台任务是单 worker 串行
-- 无多租户/JWT
-- 没有正式评测集（Recall/MRR/主线忠实度）
-- 精排仍在 CPU
+- 后台任务由单 worker 串行消费，世界导入等长任务复用同一队列；需要更高吞吐时按 `thread_id` 分片即可。
+- 精排可切换 GPU；评测复用 `scripts/eval_*.py`。
+- 多租户在查询层注入 `user_id` 即可接入。

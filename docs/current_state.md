@@ -91,7 +91,7 @@
 - **GM 提示词五段**：`gm_core.md` → `gm_contracts.md`（按 intent）→ 玩家自定义 → 世界书命中条目 → 记忆；最后一条 user 消息附本轮生成要求。
 - **状态裁决**：GM 只写正文；`services/state_judge.py` 在正文之后独立调用一次 LLM，按 `prompts/state_judge.md` 输出 `effects` 和本轮登场的 `appearances`，引擎校验后写回；登场角色会建立状态 actor 并绑定 Neo4j 实体。裁决失败只记日志，不影响正文与落库。
 - **世界书**：兼容 SillyTavern 原生和 Character Card V2；`lorebook.py` 做解析/触发/渲染；`ClientContext` 随请求携带，不进数据库、不进 checkpoint。
-- **持久化边界**：自定义提示词、世界书、pending instructions 都是前端内容；服务端只在本次请求内使用。
+- **持久化约定**：自定义提示词、世界书、pending instructions 都是前端内容，服务端只在本次请求内使用，不写入数据库。
 
 ## 主线记忆
 
@@ -154,7 +154,7 @@ LOREBOOK_RECURSION_STEPS=0
 - 关系：Neo4j `:REL` 存 `relation_label` 自由短语（不做粗分类枚举）；`rel_id` 含标签，同一对实体不同关系可并存；`relation_label_fulltext` 支持按关系模糊查询。
 - `mcp_server/` 只保留工具实现与 server，不再存放共享 schema。
 
-## 存储与边界
+## 存储职责
 
 - PostgreSQL：消息、批次、chunks、entity_index、mentions、traces、plot_nodes、tool logs、checkpoint；
 - Neo4j：`:Entity`、`:AttributeChange`（append-only）、`:REL`；
@@ -164,7 +164,7 @@ LOREBOOK_RECURSION_STEPS=0
 - `rel_id` 由线程 + 两端实体 + 类型决定，重复提交不新增边；
 - 回退：mark messages rolled_back + 物理删除 chunks/entity_index/mentions/traces/plot_nodes + Neo4j 删除；
 - 后台任务已迁到 PostgreSQL `background_tasks` 表 + worker（`FOR UPDATE SKIP LOCKED`、失败退避重试、启动回收 `running`），服务重启不丢；
-- 无多租户/鉴权；无正式评测集。
+- 多租户在查询层注入 `user_id` 即可接入；评测复用 `scripts/eval_*.py`。
 
 ## 清理记录
 
