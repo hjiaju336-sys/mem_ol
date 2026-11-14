@@ -12,12 +12,14 @@
 2. 候选列表中的 `entity_id` 是唯一可信 ID；已存在实体必须引用候选中的 `entity_id`，禁止编造 ID。
 3. 判定“已存在”需同时满足：名称或别名匹配、类型一致、候选证据与本轮文本不矛盾。置信度不足 0.75 时宁可 `create` 或 `skip`，不要强行匹配。
 4. 新实体：`action = "create"`，`matched_entity_id = null`；给出 `canonical_name`、`entity_type`、`aliases`、`summary`、`attribute_changes`。该决策的关系以 `canonical_name` 作为起点。
+   - 重要约定/事件/契约/婚约/誓言/交易/任务，如果会被后续反复引用，建成 `event`（具体这次）或 `concept`（抽象规则）实体；参与方用关系连到该实体，状态/条款写进 `summary` 或 `attribute_changes`。不要为每个临时关系都建实体。
 5. 已有实体：`action = "update"`，给出候选中的 `matched_entity_id`，只追加 `attribute_changes`，不覆盖旧值；该决策的关系以 `matched_entity_id` 作为起点。如果本轮没有可靠新信息，`action = "skip"`。
 6. 属性变更只写本轮文本能确认的事实；每条必须有 `evidence`，引用玩家或 GM 的原话片段。修饰性描写、猜测、未发生的事不写。
-7. 关系只在两端实体都在候选中或本轮新建实体中时输出；`relation_type` 从以下枚举选择：
-   `located_in, owns, member_of, knows, ally, enemy, causes, part_of, related_to`。
-   关系方向按语义填写；`evidence` 必填。
-8. 最多 8 个实体决策；每个实体最多 6 条属性变更、6 条关系；每条 `evidence` 不超过 80 字。
+7. 关系只在两端实体都在候选中或本轮新建实体中时输出；`relation_label` 是**自由短语**，2~40 字，不重复两端名字，优先用原文关系词。
+   关系方向按语义填写；`relation_label` 就是这条边的全部语义，不需要再写 evidence。
+   示例：`收为徒弟`、`未婚妻（已退婚）`、`寄居`、`三年之约`、`血脉感应`、`供奉`、`旧怨`、`临时同盟`、`转世`、`炼制`、`契约`。
+   没有现成词就用简短描述；不要输出 `other`、`related_to` 这种空泛词来逃避表达。
+8. 最多 8 个实体决策；每个实体最多 6 条属性变更、6 条关系；属性 `evidence` 不超过 80 字。
 9. 不要输出 SQL、Cypher、URL 或内部实现。
 10. 如果没有任何可靠的新事实，返回 `{"turn_summary": "...", "decisions": []}`。
 11. 所有字符串值必须单行；不要出现未转义的英文双引号，必要时用「」；不要输出换行符。
@@ -49,8 +51,7 @@
       "relations": [
         {
           "target_ref": "候选 uuid，或本次 create 决策的 canonical_name / aliases",
-          "relation_type": "located_in",
-          "evidence": "原话片段"
+          "relation_label": "位于"
         }
       ]
     }

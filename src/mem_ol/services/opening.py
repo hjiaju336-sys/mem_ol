@@ -120,7 +120,7 @@ class OpeningService:
             ]
             reply = self.llm.chat(
                 messages,
-                max_tokens=500,
+                max_tokens=1200,
                 timeout=self.settings.dialogue_timeout,
             )
             if not reply.strip():
@@ -130,7 +130,7 @@ class OpeningService:
                 )
                 reply = self.llm.chat(
                     messages,
-                    max_tokens=500,
+                    max_tokens=1200,
                     timeout=self.settings.dialogue_timeout,
                 )
             return reply.strip() or FALLBACK_OPENING

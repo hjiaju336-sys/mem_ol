@@ -65,6 +65,9 @@ class RollbackService:
             plot_nodes = self.store.delete_plot_nodes_after_turn(
                 tid, target_turn
             )
+            state_events = self.store.delete_state_after_turn(
+                tid, target_turn
+            )
             graph = self.neo4j.rollback_after_turn(tid, target_turn)
             self.store.refresh_batch_chunk_counts(tid)
             self.store.upsert_thread_state(tid, watermark)
@@ -80,6 +83,7 @@ class RollbackService:
                 "deleted_mentions": mentions,
                 "deleted_traces": traces,
                 "deleted_plot_nodes": plot_nodes,
+                "deleted_state_events": state_events,
                 "deleted_graph_attributes": graph.get("attributes", 0),
                 "deleted_graph_relations": graph.get("relations", 0),
                 "deleted_graph_entities": graph.get("entities", 0),

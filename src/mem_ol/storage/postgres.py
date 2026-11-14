@@ -631,6 +631,90 @@ class PostgresStore:
             )
             conn.commit()
 
+    def get_game_state(self, thread_id: uuid.UUID | str) -> dict[str, Any]:
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT state FROM game_states WHERE thread_id = %s",
+                (_as_uuid(thread_id),),
+            ).fetchone()
+        return row["state"] if row else {}
+
+    def save_game_state(
+        self,
+        thread_id: uuid.UUID | str,
+        turn_no: int,
+        state: dict[str, Any],
+        *,
+        kind: str = "state",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        tid = _as_uuid(thread_id)
+        with self.pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO game_states (thread_id, state, version, updated_at)
+                VALUES (%s, %s, 1, now())
+                ON CONFLICT (thread_id) DO UPDATE SET
+                    state = EXCLUDED.state,
+                    version = game_states.version + 1,
+                    updated_at = now()
+                """,
+                (tid, Jsonb(state)),
+            )
+            conn.execute(
+                """
+                INSERT INTO state_events (
+                    id, thread_id, turn_no, kind, payload, state_after
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    uuid.uuid4(),
+                    tid,
+                    int(turn_no),
+                    kind,
+                    Jsonb(payload or {}),
+                    Jsonb(state),
+                ),
+            )
+            conn.commit()
+
+    def delete_state_after_turn(
+        self, thread_id: uuid.UUID | str, target_turn: int
+    ) -> int:
+        tid = _as_uuid(thread_id)
+        with self.pool.connection() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM state_events
+                WHERE thread_id = %s AND turn_no > %s
+                """,
+                (tid, int(target_turn)),
+            )
+            deleted = int(cursor.rowcount)
+            row = conn.execute(
+                """
+                SELECT state_after FROM state_events
+                WHERE thread_id = %s AND turn_no <= %s
+                ORDER BY turn_no DESC, created_at DESC
+                LIMIT 1
+                """,
+                (tid, int(target_turn)),
+            ).fetchone()
+            state = row["state_after"] if row else {}
+            conn.execute(
+                """
+                INSERT INTO game_states (thread_id, state, version, updated_at)
+                VALUES (%s, %s, 1, now())
+                ON CONFLICT (thread_id) DO UPDATE SET
+                    state = EXCLUDED.state,
+                    version = game_states.version + 1,
+                    updated_at = now()
+                """,
+                (tid, Jsonb(state)),
+            )
+            conn.commit()
+        return deleted
+
     def delete_chunks_after_turn(
         self, thread_id: uuid.UUID | str, target_turn: int
     ) -> int:
@@ -1158,22 +1242,6 @@ class PostgresStore:
                 """,
                 (qvec, _as_uuid(thread_id), qvec, int(limit)),
             ).fetchall()
-
-    def get_entity_index(
-        self, thread_id: uuid.UUID | str, entity_id: uuid.UUID | str
-    ) -> dict[str, Any] | None:
-        with self.pool.connection() as conn:
-            return conn.execute(
-                """
-                SELECT entity_id, thread_id, canonical_name, normalized_name,
-                       entity_type, aliases, embedding_text, index_status,
-                       created_turn_no, created_batch_id, last_turn_no,
-                       last_indexed_at, updated_at
-                FROM entity_index
-                WHERE thread_id = %s AND entity_id = %s
-                """,
-                (_as_uuid(thread_id), _as_uuid(entity_id)),
-            ).fetchone()
 
     def list_entity_index(
         self, thread_id: uuid.UUID | str

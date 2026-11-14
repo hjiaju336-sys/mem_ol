@@ -44,6 +44,10 @@ class FakeStore:
         self.calls.append("plot_nodes")
         return 2
 
+    def delete_state_after_turn(self, thread_id, target_turn):
+        self.calls.append("state_events")
+        return 1
+
     def refresh_batch_chunk_counts(self, thread_id):
         self.calls.append("batches")
 
@@ -73,6 +77,7 @@ def test_rollback_orchestrates_all_stores():
         "mentions",
         "traces",
         "plot_nodes",
+        "state_events",
         "batches",
         "state",
     ]

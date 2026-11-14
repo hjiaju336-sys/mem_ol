@@ -6,7 +6,7 @@ from typing import Any, Sequence
 
 from mem_ol.config import Settings, get_settings
 from mem_ol.log import get_logger, log_context
-from mem_ol.mcp_server.schemas import (
+from mem_ol.domain import (
     AP2AnalysisResult,
     AP2ContextResult,
     AP2EntitiesResult,
@@ -40,12 +40,38 @@ class PreTurnService:
         self.rerank = rerank or get_rerank_service()
         self.query_enhancer = query_enhancer or QueryEnhancer()
 
+    def classify(
+        self,
+        thread_id: uuid.UUID | str,
+        user_message: str,
+        *,
+        turn_no: int | None = None,
+        pending_instructions: Sequence[str] = (),
+    ) -> AP2AnalysisResult:
+        """输入分流：叙事 / 元交互 / 混合。不写库、不召回。"""
+        tid = str(thread_id)
+        with log_context(thread_id=tid):
+            recent = self.store.get_recent_turns(
+                tid, self.settings.dialogue_history_turns
+            )
+            previous = self._previous_turn(recent, turn_no)
+            return self._analyze(
+                tid,
+                user_message,
+                recent,
+                previous,
+                pending_instructions=pending_instructions,
+            )
+
     def run(
         self,
         thread_id: uuid.UUID | str,
         user_message: str,
         *,
         turn_no: int | None = None,
+        analysis: AP2AnalysisResult | None = None,
+        pending_instructions: Sequence[str] = (),
+        time_label: str | None = None,
     ) -> dict[str, Any]:
         tid = str(thread_id)
         trace_id = str(uuid.uuid4())
@@ -59,15 +85,32 @@ class PreTurnService:
                 int(message["turn_no"]) for message in recent
             }
             previous = self._previous_turn(recent, turn_no)
-            analysis = self._analyze(
-                tid, user_message, recent, previous
+            if isinstance(analysis, dict):
+                analysis = AP2AnalysisResult.model_validate(analysis)
+            if analysis is None:
+                analysis = self._analyze(
+                    tid,
+                    user_message,
+                    recent,
+                    previous,
+                    pending_instructions=pending_instructions,
+                )
+            if analysis.channel == "meta":
+                return self._meta_packet(analysis, trace_id, turn_no)
+            narrative_message = (
+                analysis.narrative_query.strip()
+                if analysis.channel == "mixed" and analysis.narrative_query.strip()
+                else user_message
             )
             if previous and analysis.context_summary:
+                summary_text = analysis.context_summary
+                if time_label:
+                    summary_text = f"[{time_label}] {summary_text}"
                 try:
                     self.store.upsert_turn_summary(
                         tid,
                         int(previous["turn_no"]),
-                        analysis.context_summary,
+                        summary_text,
                         previous["message_ids"],
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -78,7 +121,7 @@ class PreTurnService:
                             "error": str(exc),
                         },
                     )
-            effective_query = analysis.rewritten_query or user_message
+            effective_query = analysis.rewritten_query or narrative_message
             terms = _dedupe(analysis.entities)
 
             # 实体检索和上下文检索的 query 一次编码，线程里只做数据库召回。
@@ -212,6 +255,11 @@ class PreTurnService:
                 "graph_paths": graph_paths,
                 "plot_context": plot_context,
                 "query_analysis": {
+                    "channel": analysis.channel,
+                    "intent": analysis.intent,
+                    "directives": analysis.directives.model_dump(),
+                    "action": analysis.action.model_dump(),
+                    "narrative_query": narrative_message,
                     "rewritten_query": effective_query,
                     "entities": terms,
                 },
@@ -256,6 +304,11 @@ class PreTurnService:
             return {
                 "trace_id": trace_id,
                 "turn_no": turn_no,
+                "channel": analysis.channel,
+                "intent": analysis.intent,
+                "directives": analysis.directives.model_dump(),
+                "action": analysis.action.model_dump(),
+                "narrative_message": narrative_message,
                 "context_summary": analysis.context_summary,
                 "entities": terms,
                 "hypothetical_entities": [
@@ -268,10 +321,81 @@ class PreTurnService:
                 "graph_paths": graph_paths,
                 "plot_context": plot_context,
                 "query_analysis": {
+                    "channel": analysis.channel,
+                    "intent": analysis.intent,
+                    "directives": analysis.directives.model_dump(),
+                    "action": analysis.action.model_dump(),
+                    "narrative_query": narrative_message,
                     "rewritten_query": effective_query,
                     "entities": terms,
                 },
             }
+
+    def meta_reply(
+        self,
+        question: str,
+        *,
+        recent: Sequence[dict[str, Any]] = (),
+    ) -> str:
+        """回答 OOC 问题；不写故事、不推进剧情。"""
+        system, user_template = load_prompt("gm_meta.md")
+        recent_text = "\n".join(
+            f"[{'玩家' if message['role'] == 'user' else 'GM'}] "
+            f"{message['content']}"
+            for message in recent[-10:]
+        ) or "（无）"
+        user_prompt = render_prompt(
+            user_template,
+            question=question,
+            recent_context=recent_text,
+        )
+        try:
+            reply = self.llm.chat(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=1200,
+                timeout=self.settings.dialogue_timeout,
+            )
+            return reply.strip() or "这个问题暂时无法回答。"
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "元问答失败",
+                extra={"event": "meta.reply.failed", "error": str(exc)},
+            )
+            return "这个问题暂时无法回答。"
+
+    def _meta_packet(
+        self,
+        analysis: AP2AnalysisResult,
+        trace_id: str,
+        turn_no: int | None,
+    ) -> dict[str, Any]:
+        logger.info(
+            "输入分流为元交互",
+            extra={
+                "event": "api2.channel.meta",
+                "turn_no": turn_no,
+                "meta_kind": analysis.meta_kind,
+                "intent": analysis.intent,
+            },
+        )
+        return {
+            "trace_id": trace_id,
+            "turn_no": turn_no,
+            "channel": "meta",
+            "intent": "meta",
+            "meta_kind": analysis.meta_kind,
+            "meta_question": analysis.meta_question,
+            "meta_reply": "",
+            "query_analysis": {
+                "channel": "meta",
+                "intent": "meta",
+                "meta_kind": analysis.meta_kind,
+                "directives": analysis.directives.model_dump(),
+            },
+        }
 
     def _expand_graph(
         self, thread_id: str, seeds: list[dict[str, Any]]
@@ -488,17 +612,25 @@ class PreTurnService:
         user_message: str,
         recent: Sequence[dict[str, Any]],
         previous: dict[str, Any] | None,
+        *,
+        pending_instructions: Sequence[str] = (),
     ) -> AP2AnalysisResult:
-        """两路并行：单轮总结+查询改写；5 轮上下文实体假设。"""
+        """两路并行：输入分流+总结+改写；5 轮上下文实体假设。"""
         recent_text = "\n".join(
             f"[{'玩家' if message['role'] == 'user' else 'GM'}] "
             f"{message['content']}"
             for message in recent
         )
         previous_text = previous["text"] if previous else "（无）"
+        pending_text = "\n".join(
+            f"- {item}" for item in pending_instructions if item.strip()
+        ) or "（无）"
         with ThreadPoolExecutor(max_workers=2) as executor:
             context_future = executor.submit(
-                self._analyze_context, user_message, previous_text
+                self._analyze_context,
+                user_message,
+                previous_text,
+                pending_text,
             )
             entities_future = executor.submit(
                 self._analyze_entities,
@@ -508,20 +640,31 @@ class PreTurnService:
             )
             context = context_future.result()
             entities = entities_future.result()
+        meta_question = context.meta_question.strip()
+        if context.channel == "meta" and context.meta_kind == "question" and not meta_question:
+            meta_question = user_message
         return AP2AnalysisResult(
+            channel=context.channel,
+            intent=context.intent,
             context_summary=context.context_summary,
-            rewritten_query=context.rewritten_query or user_message,
+            rewritten_query=(context.rewritten_query or user_message)[:800],
+            narrative_query=context.narrative_query[:1200],
+            directives=context.directives,
+            action=context.action,
+            meta_kind=context.meta_kind,
+            meta_question=meta_question[:800],
             entities=_dedupe(entities.entities),
         )
 
     def _analyze_context(
-        self, user_message: str, previous_text: str
+        self, user_message: str, previous_text: str, pending_text: str = "（无）"
     ) -> AP2ContextResult:
         system, user_template = load_prompt("api2_context.md")
         user_prompt = render_prompt(
             user_template,
             previous_turn=previous_text,
             user_message=user_message,
+            pending_instructions=pending_text,
         )
         try:
             return self.llm.chat_json_model(
@@ -530,18 +673,20 @@ class PreTurnService:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=400,
+                max_tokens=2400,
                 timeout=self.settings.dialogue_timeout,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
-                "单轮总结/查询改写失败，降级为原文查询",
+                "输入分流/总结/改写失败，降级为叙事原文",
                 extra={"event": "api2.context.failed", "error": str(exc)},
             )
             fallback = self.query_enhancer.analyze(user_message, ())
             return AP2ContextResult(
+                channel="narrative",
+                intent="default",
                 context_summary="",
-                rewritten_query=fallback.rewritten_query or user_message,
+                rewritten_query=(fallback.rewritten_query or user_message)[:800],
             )
 
     def _analyze_entities(
@@ -560,7 +705,7 @@ class PreTurnService:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=300,
+                max_tokens=1200,
                 timeout=self.settings.dialogue_timeout,
             )
         except Exception as exc:  # noqa: BLE001

@@ -35,7 +35,7 @@ def test_build_decisions_from_consolidated_extraction():
             WorldRelation(
                 source_ref="洞府",
                 target_ref="花果山",
-                relation_type="located_in",
+                relation_label="位于",
             )
         ],
     )
@@ -136,7 +136,7 @@ def test_build_decisions_offsets_source_order_by_batch():
             WorldRelation(
                 source_ref="萧炎",
                 target_ref="萧家",
-                relation_type="member_of",
+                relation_label="属于",
                 source_order=1500,
             )
         ],
@@ -173,7 +173,7 @@ def test_build_decisions_matches_existing_entities():
             WorldRelation(
                 source_ref="萧炎",
                 target_ref="萧家",
-                relation_type="member_of",
+                relation_label="属于",
                 source_order=1500,
             )
         ],

@@ -7,7 +7,7 @@ from typing import Any
 
 from mem_ol.config import Settings, get_settings
 from mem_ol.log import get_logger, log_context
-from mem_ol.mcp_server.schemas import CommitResult
+from mem_ol.domain import CommitResult
 from mem_ol.mcp_server.tools import EntityToolService
 from mem_ol.services.llm import LLMService, get_llm_service
 from mem_ol.services.prompts import load_prompt, render_prompt
@@ -70,7 +70,7 @@ class EntityCommitService:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=3200,
+                max_tokens=6000,
                 timeout=self.settings.dialogue_timeout,
             )
             # 对话轮次排在世界导入基线之后；世界导入按 batch_seq 占用低位。
@@ -174,8 +174,7 @@ def _compact_candidates(
                         "source_name": rel.get("source_name"),
                         "target_id": rel.get("target_id"),
                         "target_name": rel.get("target_name"),
-                        "relation_type": rel.get("relation_type"),
-                        "evidence": rel.get("evidence"),
+                        "relation_label": rel.get("relation_label"),
                     }
                     for rel in candidate.get("relations", [])[:4]
                 ],

@@ -1,6 +1,7 @@
 from langgraph.checkpoint.memory import MemorySaver
 
 from mem_ol.graph.conversation import ConversationGraph
+from mem_ol.domain import AP2AnalysisResult
 
 
 class FakeStore:
@@ -18,6 +19,28 @@ class FakeStore:
     def update_turn_checkpoint(self, thread_id, turn_no, checkpoint_id):
         self.checkpoints.append((turn_no, checkpoint_id))
 
+    def get_recent_turns(self, thread_id, turns):
+        return []
+
+
+class FakeMetaPreTurn:
+    def classify(
+        self,
+        thread_id,
+        user_message,
+        *,
+        turn_no=None,
+        pending_instructions=(),
+    ):
+        return AP2AnalysisResult(
+            channel="meta",
+            intent="default",
+            meta_kind="instruction",
+        )
+
+    def meta_reply(self, question, recent=()):
+        return "meta-answer"
+
 
 class FakePreTurn:
     def run(self, thread_id, user_message, *, turn_no=None):
@@ -31,7 +54,17 @@ class FakePreTurn:
 
 
 class FakeDialogue:
-    def generate(self, thread_id, user_message, *, pre_turn=None, turn_no=None):
+    def generate(
+        self,
+        thread_id,
+        user_message,
+        *,
+        pre_turn=None,
+        turn_no=None,
+        client_context=None,
+        state_view=None,
+        resolution=None,
+    ):
         return {
             "reply": f"reply-{turn_no}",
             "turn_no": turn_no,
@@ -70,3 +103,23 @@ def test_graph_turns_increment_and_checkpoint_is_written():
     assert second["turn_checkpoint_id"]
     assert second["turn_checkpoint_id"] != first["turn_checkpoint_id"]
     assert [turn for turn, _ in store.checkpoints] == [1, 2]
+
+
+def test_meta_instruction_does_not_consume_turn_or_checkpoint():
+    store = FakeStore()
+    graph = ConversationGraph(
+        store=store,
+        tools=None,
+        checkpointer=MemorySaver(),
+        pre_turn_service=FakeMetaPreTurn(),
+        dialogue_engine=FakeDialogue(),
+    )
+
+    result = graph.run("thread-1", "写短点")
+
+    assert result["channel"] == "meta"
+    assert result["meta_kind"] == "instruction"
+    assert result["turn_no"] is None
+    assert result["message_ids"] == []
+    assert store.turn == 0
+    assert store.checkpoints == []

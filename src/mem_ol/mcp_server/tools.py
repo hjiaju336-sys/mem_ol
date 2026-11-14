@@ -11,7 +11,7 @@ from typing import Any, Sequence
 
 from mem_ol.config import Settings, get_settings
 from mem_ol.log import get_logger
-from mem_ol.mcp_server.schemas import EntityDecision
+from mem_ol.domain import EntityDecision, normalize_relation_label
 from mem_ol.services.embedding import EmbeddingService, get_embedding_service
 from mem_ol.storage.neo4j import Neo4jStore
 from mem_ol.storage.postgres import PostgresStore, init_schema
@@ -25,13 +25,14 @@ def _normalize_name(name: str) -> str:
 
 
 def _relation_id(
-    thread_id: str, source_id: str, target_id: str, relation_type: str
+    thread_id: str, source_id: str, target_id: str, relation_label: str
 ) -> str:
-    """关系 ID 只由线程、两端实体和类型决定，重复提交保持同一条边。"""
+    """关系 ID 由线程、两端实体和关系标签决定；不同标签保持不同边。"""
+    label = normalize_relation_label(relation_label)
     return str(
         uuid.uuid5(
             uuid.NAMESPACE_URL,
-            f"{thread_id}:rel:{source_id}:{target_id}:{relation_type}",
+            f"{thread_id}:rel:{source_id}:{target_id}:{label}",
         )
     )
 
@@ -196,6 +197,15 @@ class EntityToolService:
             item["route_score"] = float(item.get("score", 0.0))
             candidates.append(item)
         return {"candidates": candidates}
+
+    @_logged_tool("relation_recall_keyword")
+    def relation_recall_keyword(
+        self, thread_id: str, keywords: list[str], limit: int = 10
+    ) -> dict[str, Any]:
+        rows = self.neo4j.search_relations_keyword(
+            thread_id, keywords, limit=int(limit)
+        )
+        return {"candidates": rows}
 
     @_logged_tool("entity_recall_vector")
     def entity_recall_vector(
@@ -500,12 +510,11 @@ class EntityToolService:
                             tid,
                             source_id,
                             target_id,
-                            relation.relation_type,
+                            relation.relation_label,
                         ),
                         "source_id": source_id,
                         "target_id": target_id,
-                        "relation_type": relation.relation_type,
-                        "evidence": relation.evidence,
+                        "relation_label": relation.relation_label,
                         "source_order": relation.source_order,
                     }
                 )

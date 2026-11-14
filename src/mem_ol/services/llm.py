@@ -51,6 +51,9 @@ class LLMService:
             kwargs["timeout"] = timeout
         if response_format is not None:
             kwargs["response_format"] = response_format
+        reasoning_effort = getattr(self.settings, "openai_reasoning_effort", "")
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
 
         for attempt in range(3):
             try:

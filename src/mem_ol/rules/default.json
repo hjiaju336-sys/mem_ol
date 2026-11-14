@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "state": {
+    "player": {
+      "type": "character",
+      "hp": 20,
+      "max_hp": 20,
+      "attack": 5,
+      "defense": 2,
+      "tags": [],
+      "scales": {"fatigue": 0},
+      "equipment": {"weapon": "item:starter_sword"},
+      "inventory": {}
+    },
+    "target": {
+      "type": "character",
+      "hp": 15,
+      "max_hp": 15,
+      "attack": 3,
+      "defense": 1,
+      "tags": [],
+      "scales": {"alert": 0}
+    },
+    "starter_items": {
+      "item:starter_sword": {
+        "type": "weapon",
+        "template": "iron_sword",
+        "stats": {"attack_bonus": 2, "damage_dice": "1d6"},
+        "durability": 100
+      }
+    }
+  },
+  "attack": {
+    "dc_base": 10,
+    "counter_dice": "1d3",
+    "damage_floor": 1
+  },
+  "effects": {
+    "max_per_turn": 8,
+    "hp_delta_limit": 20,
+    "scale": {
+      "min": 0,
+      "max": 100,
+      "delta_limit": 50
+    }
+  },
+  "time": {
+    "months_per_year": 12,
+    "days_per_month": 30,
+    "hours_per_day": 24,
+    "minutes_per_hour": 60,
+    "start": {
+      "year": 1,
+      "month": 1,
+      "day": 1,
+      "hour": 8,
+      "minute": 0
+    }
+  }
+}

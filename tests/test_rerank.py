@@ -126,7 +126,7 @@ def test_entity_text_is_compact():
             {
                 "source_name": "水帘洞",
                 "target_name": "花果山",
-                "relation_type": "located_in",
+                "relation_label": "位于",
             }
             for _ in range(10)
         ],

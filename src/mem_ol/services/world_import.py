@@ -8,17 +8,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from mem_ol.config import Settings, get_settings
 from mem_ol.log import get_logger, log_context
-from mem_ol.mcp_server.schemas import (
+from mem_ol.domain import (
     AttributeChangeInput,
     EntityDecision,
     EntityType,
     RelationInput,
-    RelationType,
-    normalize_relation_type,
+    normalize_relation_label,
 )
 from mem_ol.mcp_server.tools import EntityToolService
 from mem_ol.pipelines.memory import MemoryPipeline
@@ -44,15 +43,17 @@ class WorldEntity(BaseModel):
 
 
 class WorldRelation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     source_ref: str = Field(min_length=1, max_length=120)
     target_ref: str = Field(min_length=1, max_length=120)
-    relation_type: RelationType = "related_to"
+    relation_label: str = Field(default="未明确", min_length=1, max_length=80)
     source_order: int = 0
 
-    @field_validator("relation_type", mode="before")
+    @field_validator("relation_label", mode="before")
     @classmethod
-    def _fallback_relation_type(cls, value: Any) -> str:
-        return normalize_relation_type(value)
+    def _normalize_label(cls, value: Any) -> str:
+        return normalize_relation_label(value)
 
 
 class WorldImportExtraction(BaseModel):
@@ -216,7 +217,7 @@ def _attach_source_orders(
                 _normalize(relation.target_ref),
                 _normalize(relation.target_ref),
             )
-            key = (source, target, relation.relation_type)
+            key = (source, target, relation.relation_label)
             relation_orders[key] = max(
                 relation_orders.get(key, 0), relation.source_order
             )
@@ -247,7 +248,7 @@ def _attach_source_orders(
             _normalize(relation.target_ref),
             _normalize(relation.target_ref),
         )
-        key = (source, target, relation.relation_type)
+        key = (source, target, relation.relation_label)
         relation.source_order = max(
             relation.source_order, relation_orders.get(key, 0)
         )
@@ -315,18 +316,18 @@ def _merge_extractions(
             relation_key = (
                 source_key,
                 target_key,
-                relation.relation_type,
+                relation.relation_label,
             )
             relation_orders[relation_key] = max(
                 relation_orders.get(relation_key, 0),
                 relation.source_order,
             )
 
-    for (source_key, target_key, relation_type), order in (
+    for (source_key, target_key, relation_label), order in (
         relation_orders.items()
     ):
         relations.append(
-            (source_key, target_key, relation_type, order)
+            (source_key, target_key, relation_label, order)
         )
 
     return merged, relations
@@ -338,7 +339,7 @@ def _fallback_consolidate(
     """检查 agent 失败时的简单兜底：只按 exact canonical 合并。"""
     entities, relations = _merge_extractions(extractions)
     relation_models: list[WorldRelation] = []
-    for source_key, target_key, relation_type, order in relations:
+    for source_key, target_key, relation_label, order in relations:
         source = entities.get(source_key)
         target = entities.get(target_key)
         if source is None or target is None:
@@ -347,7 +348,7 @@ def _fallback_consolidate(
             WorldRelation(
                 source_ref=source.canonical_name,
                 target_ref=target.canonical_name,
-                relation_type=relation_type,
+                relation_label=relation_label,
                 source_order=order,
             )
         )
@@ -410,30 +411,30 @@ def _build_decisions(
         target_key = alias_to_key.get(_normalize(relation.target_ref))
         if not source_key or not target_key or source_key == target_key:
             continue
-        relation_key = (source_key, target_key, relation.relation_type)
+        relation_key = (source_key, target_key, relation.relation_label)
         relation_orders[relation_key] = max(
             relation_orders.get(relation_key, 0),
             relation.source_order,
         )
 
-    for (source_key, target_key, relation_type), order in (
+    for (source_key, target_key, relation_label), order in (
         relation_orders.items()
     ):
         relations_by_source.setdefault(source_key, []).append(
-            (target_key, relation_type, order)
+            (target_key, relation_label, order)
         )
 
     batch_offset = int(batch_seq) * 1_000_000
     decisions: list[EntityDecision] = []
     for source_key, entity in entities_by_key.items():
         relation_inputs: list[RelationInput] = []
-        for target_key, relation_type, order in relations_by_source.get(
+        for target_key, relation_label, order in relations_by_source.get(
             source_key, []
         )[:6]:
             relation_inputs.append(
                 RelationInput(
                     target_ref=entity_refs[target_key],
-                    relation_type=relation_type,
+                    relation_label=relation_label,
                     source_order=batch_offset + order,
                 )
             )

@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from mem_ol.mcp_server.schemas import (
+from mem_ol.domain import (
     AP2AnalysisResult,
     CommitResult,
     EntityDecision,
@@ -57,14 +57,36 @@ def test_valid_commit_plan():
 
 
 def test_relation_id_is_stable_across_commits():
-    first = _relation_id("thread", "source", "target", "knows")
-    second = _relation_id("thread", "source", "target", "knows")
+    first = _relation_id("thread", "source", "target", "收为徒弟")
+    second = _relation_id("thread", "source", "target", "收为徒弟")
 
     assert first == second
-    assert first != _relation_id("thread", "source", "target", "ally")
+    assert first != _relation_id("thread", "source", "target", "敌对")
 
 
-def test_invalid_relation_type_falls_back_to_related_to():
+def test_free_relation_label_is_preserved():
+    result = CommitResult.model_validate(
+        {
+            "turn_summary": "",
+            "decisions": [
+                {
+                    "action": "create",
+                    "canonical_name": "药老",
+                    "entity_type": "character",
+                    "relations": [
+                        {
+                            "target_ref": "萧炎",
+                            "relation_label": "收为徒弟",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    assert result.decisions[0].relations[0].relation_label == "收为徒弟"
+
+
+def test_empty_relation_label_falls_back_to_unspecified():
     result = CommitResult.model_validate(
         {
             "turn_summary": "",
@@ -73,15 +95,12 @@ def test_invalid_relation_type_falls_back_to_related_to():
                     "action": "create",
                     "canonical_name": "甲",
                     "entity_type": "character",
-                    "relations": [
-                        {"target_ref": "乙", "relation_type": "拥有"}
-                    ],
+                    "relations": [{"target_ref": "乙", "relation_label": ""}],
                 }
             ],
         }
     )
-
-    assert result.decisions[0].relations[0].relation_type == "related_to"
+    assert result.decisions[0].relations[0].relation_label == "未明确"
 
 
 def test_dialogue_order_is_after_world_import_baseline():

@@ -239,9 +239,9 @@ def _entity_text(candidate: dict[str, Any]) -> str:
     for relation in candidate.get("relations", [])[:4]:
         source = relation.get("source_name")
         target = relation.get("target_name")
-        rel_type = relation.get("relation_type")
-        if source and target and rel_type:
-            parts.append(f"{source}-{rel_type}->{target}")
+        rel_label = relation.get("relation_label")
+        if source and target and rel_label:
+            parts.append(f"{source}-{rel_label}->{target}")
     return "；".join(part for part in parts if part)[:320]
 
 

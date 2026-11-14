@@ -1,32 +1,50 @@
-# 当前状态与交接（2026-11-13 清理后）
+# 可迁移叙事记忆内核：当前状态与交接（2026-11-14）
 
 > 用于在此之上继续修改。详细规格见 `需求`，工程约定见 `CLAUDE.md`，流程图见 `docs/business_flow.md`。
 
 ## 定位
 
-AI 文字冒险 / AI TRPG 的叙事记忆层：让 GM 记得住、回得去、主线不崩。
+**经过验证的可迁移叙事记忆内核**，不是绑定单一作品的 Demo。内核负责记忆、召回、主线、回退与状态；Streamlit、游戏 GM、数值/时间系统是参考前端与扩展层。
 
-三条能力：
+三条核心能力：
 
 1. 5 轮增量记忆 + 实体关系图 + 双路召回；
 2. turn 级回退，消息、向量、图、主线摘要一起回滚；
 3. L0/L1/L2 三层主线摘要，防止长对话碎片化。
 
+## 验证摘要
+
+- 60k 外部语料：806 chunks / 57 实体 / 68 关系，无降级；
+- 20 轮对话：20/20 完成，L0 29 / L1 5 / L2 1；
+- 记忆探针：8/10 完整、2/10 部分；
+- 路由：16 题任一路 @5 = 1.0；20 轮中上下文 9/10、实体 10/10、主线 9/10；
+- 回退、长程召回、时间推进均通过；
+- 79 个测试通过。
+
+细节见 `docs/eval_glm_2026-11-14.md`、`docs/eval_v2_2026-11-13.md`。
+
 ## 每轮流程
 
 ```text
 用户输入
-  ├─ API2-A 单轮总结 + 查询改写（上一轮单轮）
+  ├─ API2-A 输入分流（narrative/meta/mixed）+ 单轮总结 + 查询改写
   ├─ API2-B 实体假设（最近 5 轮）
   ↓ 两路并行
+  ├─ meta：写/读 pending instructions，不召回、不落库、不计 turn
   ├─ 实体召回：关键词一次 + 向量一次 → RRF → 1~2 跳
   ├─ 上下文召回：rewritten_query + context_summary
   └─ 主线召回：L2 常驻 + L1 章节（turn_end <= current-5）
   ↓
   rerank（实体 0.6 / 上下文 0.4）
   ↓
-  GM 生成（最近 5 轮原文 + 主线 + 召回）
+  state：读 game_states；attack 时引擎掷骰/伤害，产出 Resolution
   ↓
+  GM 五段拼装：核心规则 + 响应契约 + 玩家自定义 + 世界书 + 记忆
+     + 当前状态卡（含历法时间）+ 本轮结算（数值权威）
+  ↓
+  reconcile：GM effects（标签/数值/flag/时间）经引擎校验后写回状态
+     （重复结算 HP 会被拒绝）
+  ↓ 隐藏 plan 自检，只返回 reply
   persist：消息落库、L0 摘要入 plot_nodes
   ↓
   后台：API3 实体固化、5 轮入库、plot 维护（归档/章节/全局）
@@ -34,10 +52,20 @@ AI 文字冒险 / AI TRPG 的叙事记忆层：让 GM 记得住、回得去、�
 
 ## API 2
 
-- `prompts/api2_context.md`：只看上一轮，输出 `context_summary` + `rewritten_query`；
+- `prompts/api2_context.md`：先判断 `channel`（narrative/meta/mixed）和 `intent`，再看上一轮输出 `context_summary` + `rewritten_query`；meta 时输出 `directives`/`meta_question`；
 - `prompts/api2_entities.md`：看最近 5 轮，输出扁平 `entities`；
 - 两路独立失败降级；
 - 上下文 query 使用 `rewritten_query + context_summary`。
+
+## 输入分流、元交互与玩家自定义
+
+- **narrative**：正常召回 + GM + 落库。
+- **meta**：纯元指令不生成正文、不落消息、不计 turn；前端保存为 `pending_instructions`，下次叙事请求静默生效。OOC 问题走 `gm_meta.md`，回答只进系统回答区。
+- **mixed**：拆出 `narrative_query` 走故事流程，`directives` 作为本轮生成参数。
+- **GM 提示词五段**：`gm_core.md` → `gm_contracts.md`（按 intent）→ 玩家自定义 → 世界书命中条目 → 记忆；最后一条 user 消息附本轮生成要求。
+- **隐藏 plan**：GM 返回 `{"plan": {...}, "reply": "..."}`，代码只使用 `reply`，`plan` 仅记日志。
+- **世界书**：兼容 SillyTavern 原生和 Character Card V2；`lorebook.py` 做解析/触发/渲染；`ClientContext` 随请求携带，不进数据库、不进 checkpoint。
+- **持久化边界**：自定义提示词、世界书、pending instructions 都是前端内容；服务端只在本次请求内使用。
 
 ## 主线记忆
 
@@ -76,7 +104,29 @@ DIALOGUE_HISTORY_TURNS=5
 PLOT_ARC_SIZE=5
 PLOT_RECALL_TOP_K=3
 PLOT_RECALL_MIN_SCORE=0.3
+
+CUSTOM_PROMPT_MAX_CHARS=4000
+LOREBOOK_SCAN_DEPTH=3
+LOREBOOK_MAX_CHARS=1500
+LOREBOOK_MAX_ENTRIES=2000
+LOREBOOK_MAX_BYTES=2000000
+LOREBOOK_RECURSION_STEPS=0
+
+# 可选：自定义规则包
+# MEM_OL_RULES_PATH=./src/mem_ol/rules/default.json
 ```
+
+## 结构约定
+
+- `domain/`：共享枚举、Pydantic 模型、规则包；业务代码不再从 `mcp_server.schemas` 导入。
+- `domain/models.py`：API2/GM/实体写入模型。
+- `domain/enums.py`：channel/intent/action/effect 等闭集。
+- `domain/rules.py` + `rules/default.json`：默认角色/武器、检定基础值、效果上限；按 mtime 热加载，支持 `MEM_OL_RULES_PATH`。
+- `api/schemas.py`：HTTP 请求与客户端上下文模型。
+- `prompts/gm_output.md`：GM JSON 输出格式与 effects 约束，改提示词不用改代码。
+- `scripts/validate_assets.py`：校验规则包与所有提示词文件，改配置后先跑一遍。
+- 关系：Neo4j `:REL` 存 `relation_label` 自由短语（不做粗分类枚举）；`rel_id` 含标签，同一对实体不同关系可并存；`relation_label_fulltext` 支持按关系模糊查询。
+- `mcp_server/` 只保留工具实现与 server，不再存放共享 schema。
 
 ## 存储与边界
 
@@ -96,4 +146,4 @@ PLOT_RECALL_MIN_SCORE=0.3
 - 删除生成的测试文本：`doupo_{2000,5000,10000,append_2k,smoke}.txt`、`rulin_{20000,150000}.txt`、`xiyouji_001_raw.txt`；保留 `doupo_excerpt.txt`、`rulin_raw.txt`、`rulin_001_002.txt`、`xiyouji_001.txt`；
 - 清空 PostgreSQL / Neo4j 中所有测试会话与数据；
 - 删除 `.playwright-mcp`、`.pytest_cache`、`__pycache__`、历史日志；
-- 当前测试：`41 passed`。
+- 当前测试：`79 passed`。

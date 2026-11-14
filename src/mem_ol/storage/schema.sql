@@ -67,6 +67,26 @@ CREATE TABLE IF NOT EXISTS thread_states (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS game_states (
+    thread_id uuid PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+    state jsonb NOT NULL DEFAULT '{}'::jsonb,
+    version integer NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS state_events (
+    id uuid PRIMARY KEY,
+    thread_id uuid NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    turn_no integer NOT NULL,
+    kind text NOT NULL,
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+    state_after jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_state_events_thread_turn
+    ON state_events (thread_id, turn_no);
+
 CREATE TABLE IF NOT EXISTS chunks (
     id uuid PRIMARY KEY,
     thread_id uuid NOT NULL REFERENCES threads(id) ON DELETE CASCADE,

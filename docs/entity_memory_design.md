@@ -246,7 +246,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_call_logs_trace
 
 (:Entity)-[:REL {
   rel_id: "uuid",
-  relation_type: "located_in",
+  relation_label: "位于",
   thread_id: "uuid",
   batch_id: "uuid",
   occurred_at: datetime,
@@ -256,7 +256,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_call_logs_trace
 }]->(:Entity)
 ```
 
-- `relation_type` 受控枚举：`located_in, owns, member_of, knows, ally, enemy, causes, part_of, related_to`。
+- `relation_label` 是 2~40 字自由短语，不做枚举限制；同一对实体的不同标签是不同边。
 - 允许多重边；不覆盖旧关系。
 - 属性当前值 = 按 `occurred_at DESC` 取第一条；旧值全部保留。
 - `summary` 是可更新的展示摘要，不承载事实变更；事实一律进 `AttributeChange`。
@@ -388,7 +388,7 @@ API 3 是实体与关系的**唯一写入口**。它拿到：本轮玩家输入�
       "relations": [
         {
           "target_ref": "uuid-of-花果山",
-          "relation_type": "located_in",
+          "relation_label": "位于",
           "evidence": "水帘洞位于花果山瀑布之后"
         }
       ]
@@ -408,7 +408,7 @@ API 3 是实体与关系的**唯一写入口**。它拿到：本轮玩家输入�
       "relations": [
         {
           "target_ref": "水帘洞",
-          "relation_type": "located_in",
+          "relation_label": "位于",
           "evidence": "石桌石碗在水帘洞内"
         }
       ]

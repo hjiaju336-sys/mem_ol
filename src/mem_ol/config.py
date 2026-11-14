@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     openai_timeout: float = 60.0
     openai_max_retries: int = 0
     openai_temperature: float = 0.8
+    openai_reasoning_effort: str = ""
     dialogue_timeout: float = 120.0
     dialogue_order_base: int = 1_000_000_000
 
@@ -70,6 +71,15 @@ class Settings(BaseSettings):
     memory_context_char_limit: int = 700
     gm_max_tokens: int = 800
     dialogue_history_turns: int = 5
+
+    custom_prompt_max_chars: int = 4000
+    pending_instruction_max: int = 3
+    pending_instruction_char_limit: int = 300
+    lorebook_scan_depth: int = 3
+    lorebook_max_chars: int = 1500
+    lorebook_max_entries: int = 2000
+    lorebook_max_bytes: int = 2_000_000
+    lorebook_recursion_steps: int = 0
 
     rerank_enabled: bool = True
     rerank_model_path: str = (

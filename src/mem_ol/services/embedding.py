@@ -90,9 +90,6 @@ class EmbeddingService:
             )
         return array.tolist()
 
-    def embed_one(self, text: str) -> list[float]:
-        return self.embed([text])[0]
-
     def embed_query(self, text: str) -> list[float]:
         return self.embed([f"{self.query_instruction}{text}"])[0]
 

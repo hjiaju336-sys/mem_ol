@@ -21,20 +21,10 @@ ENTITY_TYPES = (
     "other",
 )
 
-RELATION_TYPES = (
-    "located_in",
-    "owns",
-    "member_of",
-    "knows",
-    "ally",
-    "enemy",
-    "causes",
-    "part_of",
-    "related_to",
-)
-
 _FULLTEXT_INDEX = "entity_name_fulltext"
+_REL_FULLTEXT_INDEX = "relation_label_fulltext"
 _FULLTEXT_CALL = "db.index.fulltext.queryNodes"
+_REL_FULLTEXT_CALL = "db.index.fulltext.queryRelationships"
 
 
 def _jsonable(value: Any) -> Any:
@@ -67,10 +57,6 @@ class Neo4jStore:
     def close(self) -> None:
         self.driver.close()
 
-    def ping(self) -> bool:
-        with self.driver.session() as session:
-            return session.run("RETURN 1 AS ok").single()["ok"] == 1
-
     def init_schema(self) -> None:
         statements = [
             """
@@ -96,6 +82,11 @@ class Neo4jStore:
             """
             CREATE FULLTEXT INDEX entity_name_fulltext IF NOT EXISTS
             FOR (e:Entity) ON EACH [e.canonical_name, e.aliases]
+            OPTIONS { indexConfig: { `fulltext.analyzer`: 'cjk' } }
+            """,
+            """
+            CREATE FULLTEXT INDEX relation_label_fulltext IF NOT EXISTS
+            FOR ()-[r:REL]-() ON EACH [r.relation_label]
             OPTIONS { indexConfig: { `fulltext.analyzer`: 'cjk' } }
             """,
         ]
@@ -185,6 +176,70 @@ class Neo4jStore:
             ).data()
         return _jsonable(rows)
 
+    def search_relations_keyword(
+        self,
+        thread_id: uuid.UUID | str,
+        keywords: Sequence[str],
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """按关系标签关键词查边；先走关系全文索引，失败退化为 CONTAINS。"""
+        terms = [str(term).strip() for term in keywords if str(term).strip()]
+        if not terms:
+            return []
+        tid = str(thread_id)
+        fulltext_query = " OR ".join(_escape_lucene(term) for term in terms)
+        cypher = f"""
+        CALL {_REL_FULLTEXT_CALL}($index, $search_query)
+        YIELD relationship, score
+        WHERE startNode(relationship).thread_id = $thread_id
+          AND endNode(relationship).thread_id = $thread_id
+        RETURN startNode(relationship).canonical_name AS source_name,
+               coalesce(relationship.relation_label, '') AS relation_label,
+               endNode(relationship).canonical_name AS target_name,
+               score
+        ORDER BY score DESC
+        LIMIT $limit
+        """
+        try:
+            with self.driver.session() as session:
+                rows = session.run(
+                    cypher,
+                    index=_REL_FULLTEXT_INDEX,
+                    search_query=fulltext_query,
+                    thread_id=tid,
+                    limit=int(limit),
+                ).data()
+            if rows:
+                return _jsonable(rows)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "关系全文检索失败，降级 CONTAINS",
+                extra={
+                    "event": "neo4j.rel_fulltext.fallback",
+                    "thread_id": tid,
+                    "error": str(exc),
+                },
+            )
+
+        fallback = """
+        MATCH (s:Entity {thread_id: $thread_id})-[r:REL]->(t:Entity {thread_id: $thread_id})
+        WHERE any(k IN $keywords
+                  WHERE r.relation_label CONTAINS k)
+        RETURN s.canonical_name AS source_name,
+               r.relation_label AS relation_label,
+               t.canonical_name AS target_name,
+               0.5 AS score
+        LIMIT $limit
+        """
+        with self.driver.session() as session:
+            rows = session.run(
+                fallback,
+                thread_id=tid,
+                keywords=terms,
+                limit=int(limit),
+            ).data()
+        return _jsonable(rows)
+
     def get_entity(
         self,
         thread_id: uuid.UUID | str,
@@ -246,8 +301,7 @@ class Neo4jStore:
                            endNode(r).entity_id AS target_id,
                            endNode(r).canonical_name AS target_name,
                            r.rel_id AS rel_id,
-                           r.relation_type AS relation_type,
-                           r.evidence AS evidence,
+                           r.relation_label AS relation_label,
                            r.source_order AS source_order,
                            r.batch_id AS batch_id,
                            r.trace_id AS trace_id,
@@ -291,7 +345,7 @@ class Neo4jStore:
                 }}] AS nodes,
                [rel IN relationships(path) | {{
                     rel_id: rel.rel_id,
-                    relation_type: rel.relation_type,
+                    relation_label: rel.relation_label,
                     start_id: startNode(rel).entity_id,
                     end_id: endNode(rel).entity_id
                 }}] AS edges
@@ -536,7 +590,7 @@ class Neo4jStore:
                     MATCH (s:Entity {entity_id: rel.source_id, thread_id: $thread_id})
                     MATCH (t:Entity {entity_id: rel.target_id, thread_id: $thread_id})
                     MERGE (s)-[r:REL {rel_id: rel.rel_id}]->(t)
-                    ON CREATE SET r.relation_type = rel.relation_type,
+                    ON CREATE SET r.relation_label = rel.relation_label,
                                   r.thread_id = $thread_id,
                                   r.batch_id = $batch_id,
                                   r.occurred_at = $occurred_at,
@@ -544,7 +598,6 @@ class Neo4jStore:
                                   r.turn_no = $turn_no,
                                   r.source_chunk_nos = $source_chunk_nos,
                                   r.source_message_ids = $source_message_ids,
-                                  r.evidence = rel.evidence,
                                   r.source_order = coalesce(rel.source_order, 0)
                     RETURN count(r) AS relation_count
                     """,

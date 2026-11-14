@@ -168,7 +168,7 @@ class PlotMemoryService:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=300,
+                max_tokens=1200,
                 timeout=self.settings.dialogue_timeout,
             )
             return reply.strip() or "；".join(summaries)[:400]
@@ -192,7 +192,7 @@ class PlotMemoryService:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=400,
+                max_tokens=1600,
                 timeout=self.settings.dialogue_timeout,
             )
             return reply.strip() or f"{old_summary}\n{new_text}"[:600]

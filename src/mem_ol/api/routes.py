@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
-from pydantic import BaseModel, Field
 
+from mem_ol.api.schemas import (
+    ChatRequest,
+    LorebookPreviewRequest,
+    RollbackRequest,
+    ThreadCreate,
+    WorldImportRequest,
+    WorldviewRequest,
+)
 from mem_ol.config import Settings
 from mem_ol.log import get_logger
 from mem_ol.mcp_server.tools import EntityToolService
 from mem_ol.pipelines.memory import MemoryPipeline
 from mem_ol.services.entity_commit import EntityCommitService
+from mem_ol.services.game_state import GameStateService
 from mem_ol.services.llm import LLMService, get_llm_service
+from mem_ol.services.lorebook import parse_lorebook, select_entries
 from mem_ol.services.opening import OpeningService
 from mem_ol.services.plot_memory import PlotMemoryService
 from mem_ol.services.pre_turn import PreTurnService
@@ -23,39 +33,28 @@ router = APIRouter(prefix="/api")
 logger = get_logger(__name__)
 
 
-class ThreadCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-
-
-class ChatRequest(BaseModel):
-    content: str = Field(min_length=1)
-    checkpoint_id: str | None = None
-
-
-class WorldviewRequest(BaseModel):
-    text: str = Field(min_length=1)
-    source_name: str | None = None
-
-
-class WorldImportRequest(BaseModel):
-    text: str = Field(min_length=1)
-    source_name: str | None = None
-    append: bool = False
-    doc_id: str | None = None
-    char_start: int = 0
-    char_end: int | None = None
-
-
-class RollbackRequest(BaseModel):
-    target_turn: int = Field(ge=0)
-
-
 def _store(request: Request) -> PostgresStore:
     return request.app.state.store
 
 
 def _settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+def _check_lorebook_size(
+    lorebook: dict[str, Any] | None, max_bytes: int
+) -> None:
+    if not lorebook:
+        return
+    try:
+        size = len(json.dumps(lorebook, ensure_ascii=False))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="世界书不是合法 JSON") from exc
+    if size > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"世界书超过 {max_bytes} 字节上限",
+        )
 
 
 def _tools(request: Request) -> EntityToolService:
@@ -221,6 +220,15 @@ def get_thread(
     return _require_thread(_store(request), thread_id)
 
 
+@router.get("/threads/{thread_id}/state")
+def get_game_state(
+    thread_id: uuid.UUID, request: Request
+) -> dict[str, Any]:
+    store = _store(request)
+    _require_thread(store, thread_id)
+    return GameStateService(store).view(thread_id)
+
+
 @router.get("/threads/{thread_id}/messages")
 def list_messages(
     thread_id: uuid.UUID, request: Request
@@ -260,6 +268,47 @@ def pre_turn(
     ).run(thread_id, payload.content, turn_no=turn_no)
 
 
+@router.post("/lorebook/preview")
+def lorebook_preview(
+    payload: LorebookPreviewRequest, request: Request
+) -> dict[str, Any]:
+    """无状态预览：不保存世界书，只返回本轮会命中的条目。"""
+    settings = _settings(request)
+    _check_lorebook_size(payload.lorebook, settings.lorebook_max_bytes)
+    try:
+        book = parse_lorebook(payload.lorebook)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        entries = select_entries(
+            book,
+            payload.text,
+            recent_messages=payload.recent_messages,
+            scan_depth=settings.lorebook_scan_depth,
+            max_chars=settings.lorebook_max_chars,
+            recursion_steps=settings.lorebook_recursion_steps,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400, detail=f"世界书触发失败：{exc}"
+        ) from exc
+    return {
+        "name": book.name,
+        "format": book.source_format,
+        "entry_count": len(book.entries),
+        "active": [
+            {
+                "uid": entry.uid,
+                "keys": entry.keys,
+                "order": entry.order,
+                "constant": entry.constant,
+                "position": entry.position,
+            }
+            for entry in entries
+        ],
+    }
+
+
 @router.post("/threads/{thread_id}/messages")
 def chat(
     thread_id: uuid.UUID,
@@ -273,9 +322,40 @@ def chat(
     llm = get_llm_service()
     _require_thread(store, thread_id)
 
-    state = request.app.state.conversation_graph.run(
-        str(thread_id), payload.content
+    client_context = (
+        payload.client_context.model_dump()
+        if payload.client_context is not None
+        else None
     )
+    _check_lorebook_size(
+        (client_context or {}).get("lorebook"),
+        settings.lorebook_max_bytes,
+    )
+    state = request.app.state.conversation_graph.run(
+        str(thread_id), payload.content, client_context=client_context
+    )
+
+    if state.get("channel") == "meta":
+        try:
+            current_view = GameStateService(store).view(thread_id)
+        except Exception:  # noqa: BLE001
+            current_view = {}
+        return {
+            "reply": "",
+            "channel": "meta",
+            "turn_no": None,
+            "intent": "meta",
+            "meta_kind": state.get("meta_kind", "instruction"),
+            "meta_reply": state.get("meta_reply", ""),
+            "directives": state.get("directives", {}),
+            "lorebook_active": [],
+            "message_ids": [],
+            "state_view": current_view,
+            "resolution": None,
+            "pending_turns": 0,
+            "ingest_scheduled": False,
+            "commit_scheduled": False,
+        }
 
     ingest_scheduled = bool(state.get("ingest_required"))
     if ingest_scheduled:
@@ -296,7 +376,7 @@ def chat(
             llm,
             settings,
             thread_id,
-            payload.content,
+            state.get("narrative_message") or payload.content,
             state["reply"],
             packet,
             int(state["turn_no"]),
@@ -315,7 +395,17 @@ def chat(
 
     return {
         "reply": state.get("reply", ""),
+        "channel": "narrative",
         "turn_no": state.get("turn_no"),
+        "intent": state.get("intent", "default"),
+        "meta_kind": None,
+        "meta_reply": None,
+        "directives": (state.get("pre_turn") or {}).get("directives", {}),
+        "lorebook_active": state.get("lorebook_active", []),
+        "state_view": state.get("state_view", {}),
+        "resolution": state.get("resolution"),
+        "applied_effects": state.get("applied_effects", []),
+        "effects_rejected": state.get("effects_rejected", []),
         "history_messages": state.get("history_messages", 0),
         "retrieved": state.get("retrieved", []),
         "trace_id": state.get("trace_id"),

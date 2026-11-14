@@ -1,6 +1,7 @@
-# 当前业务流程与信息处理说明
+# 可迁移记忆内核：当前业务流程与信息处理说明
 
-> 本文描述的是**当前已实现代码**的真实流程，不是最终规格。用于核对理解，发现偏差请直接指出。
+> 本文描述的是**可迁移记忆内核的参考实现**，不是最终规格。用于核对理解，发现偏差请直接指出。
+> 内核不绑定具体作品；Streamlit、游戏 GM、数值/时间状态是参考前端与扩展层。验证结果见 `docs/eval_glm_2026-11-14.md`。
 
 ## 1. 系统全景
 
@@ -115,9 +116,11 @@ sequenceDiagram
 
 1. 编排层直接从 `messages` 读取最近 5 轮消息（含已入库），拼入提示词；**确定性读取不走 MCP**。
 2. API 2 两路并行 LLM：
-   - `api2_context.md`：只看上一轮，输出 `context_summary`（单轮总结）和 `rewritten_query`；
+   - `api2_context.md`：先做输入分流，输出 `channel`（narrative/meta/mixed）和叙事 `intent`；再看上一轮输出 `context_summary` 和 `rewritten_query`。纯 meta 时输出 `directives` 或 `meta_question`。
    - `api2_entities.md`：看最近 5 轮，输出扁平 `entities` 检索词（实体名、别名、关键词，最多 12 个）。
    - **上下文检索用 `rewritten_query + context_summary`，实体检索用 `entities`**；单路失败时各自降级。
+   - **纯 meta**：不召回、不生成故事、不落消息、不计 turn。前端保存为 `pending_instructions`，下次叙事请求静默生效；OOC 问题由 `gm_meta.md` 单独回答。
+   - **mixed**：拆出 `narrative_query` 走故事流程，元要求作为本轮 `directives`。
 3. 用 `entities` 做一次实体召回：
    - **关键词路**：Neo4j CJK 全文索引；失败降级 `CONTAINS`。
    - **向量路**：PostgreSQL `entity_index`，查询 bge-large-zh-v1.5 向量。
@@ -142,11 +145,14 @@ sequenceDiagram
 
 - 读取最近 5 轮原始消息作为完整上下文，无论是否已入库；召回结果过滤掉完全落在这 5 轮内的 chunk，避免重复。
 - 当前这一轮用户输入在生成时还未落库，会单独追加在历史之后；所以实际是“最近 5 轮历史 + 当前输入”。
-- 系统提示词包含：
-  - GM 角色约束；
-  - 精排后的实体 top6；
-  - 精排后的上下文父块 top4；
-  - 实体多跳关系路径。
+- 系统提示词五段拼装：
+  - `gm_core.md`：GM 核心规则；
+  - `gm_contracts.md`：按 `intent` 选择本轮响应契约（行动/调查/社交/战斗/日常/修炼/询问/默认）；
+  - 玩家自定义提示词（前端随请求携带，不落库）；
+  - 世界书命中条目（before/after 两段，前端携带，不落库）；
+  - 记忆：主线、精排后的实体 top6、上下文父块 top4、多跳关系路径。
+- 最后一条 user 消息追加本轮生成要求：契约、`directives`、`pending_instructions`、上一轮承接摘要；要求正文不得确认或复述这些要求。
+- GM 先输出隐藏的 `plan`（intent/expected_outcome/continuity/state_change），代码只取 `reply`；`plan` 仅记日志。
 - 调用 LLM 生成 GM 回复；不在本节点落库。
 
 ### 3.4 persist
@@ -182,7 +188,7 @@ flowchart TD
     F --> G[Entity / AttributeChange / REL]
     F --> H[再同步 PostgreSQL entity_index]
     H --> I[entity_mentions + tool_call_logs]
-    H --> J[索引失败写 entity_index_jobs 供重试]
+    H --> J[索引失败写 entity_index_jobs<br/>当前无消费端]
 ```
 
 规则：
@@ -190,7 +196,7 @@ flowchart TD
 - 已存在实体必须引用候选中的 `entity_id`。
 - 新实体由 MCP 生成 `entity_id`。
 - 属性 append-only，不覆盖旧值；关系允许多重边。
-- 关系类型受控枚举：`located_in/owns/member_of/knows/ally/enemy/causes/part_of/related_to`。
+- 关系使用自由 `relation_label`（2~40 字），不做枚举限制；`rel_id` 包含标签，同一对实体的不同关系可并存。
 - Neo4j 写成功即视为实体写入成功；PG 索引失败不阻塞，可重建。
 - 每个实体 mention、属性变更、关系都带 `trace_id`、`batch_id`、`chunk_nos`、`message_ids`、`evidence`。
 
@@ -232,7 +238,7 @@ flowchart TD
 | `plot_nodes` | 三层主线：L0 单轮摘要 / L1 章节摘要 / L2 全局梗概 |
 | `entity_index` | Neo4j 实体的派生名称向量索引 |
 | `entity_mentions` | 实体 → 消息/片段/批次/trace |
-| `entity_index_jobs` | PG 索引失败重试队列 |
+| `entity_index_jobs` | PG 索引失败记录（只写不消费，重试 worker 未实现） |
 | `tool_call_logs` | MCP 工具调用审计 |
 | LangGraph checkpoint 表 | 每轮 state 快照，默认保留 5 轮 |
 
@@ -297,7 +303,7 @@ MCP server 通过 `scripts/run_mcp_server.py` 独立暴露，默认 `127.0.0.1:8
 - 三层主线摘要（L0 单轮 / L1 章节 / L2 全局）
 - API 3 实体/属性/关系固化，MCP `entity_commit_plan`
 - checkpoint 保留 5 轮
-- 41 个测试
+- 79 个测试
 
 **当前边界：**
 
