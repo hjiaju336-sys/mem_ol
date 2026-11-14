@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"/>
-<title>mem_ol 业务逻辑流程图</title>
+<title>mem_ol 可迁移记忆内核 业务逻辑流程图</title>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
 <style>
   body { background: #fff; color: #1f2937; font-family: "Microsoft YaHei", "PingFang SC", sans-serif; padding: 28px; }
@@ -13,17 +13,20 @@
 </style>
 </head>
 <body>
-  <h1>mem_ol 业务逻辑流程图</h1>
-  <p>单轮对话、召回、后台维护、回退；世界导入见第二张。</p>
+  <h1>mem_ol 可迁移记忆内核 · 业务逻辑流程图</h1>
+  <p>输入分流、召回、GM、状态/时间、后台维护、回退、世界导入与可迁移边界。</p>
 
-  <h2>1. 单轮对话 + 召回 + 后台维护</h2>
+  <h2>1. 单轮对话 + 分流 + 召回 + 状态 + 后台维护</h2>
   <div class="diagram">
   <pre class="mermaid">
 flowchart TD
-    U["玩家输入"] --> PREP["LangGraph prepare<br/>计算 turn_no / 读取最近 5 轮"]
+    U["玩家输入 / ClientContext<br/>custom_prompt + pending + lorebook"] --> CLASSIFY["输入分流 API2-A<br/>narrative / meta / mixed"]
+
+    CLASSIFY -- meta --> META["元交互<br/>OOC 回答 / 临时指令<br/>不落库、不计 turn"]
+    CLASSIFY -- narrative / mixed --> PREP["LangGraph prepare<br/>计算 turn_no / 清空上一轮字段"]
 
     subgraph TURN["单轮主链路（同步）"]
-        PREP --> A2A["API2-A：单轮总结 + 查询改写<br/>只看上一轮"]
+        PREP --> A2A["API2-A：单轮总结 + 查询改写"]
         PREP --> A2B["API2-B：实体假设<br/>最近 5 轮"]
         A2A --> CTXQ["上下文 query<br/>rewritten_query + context_summary"]
         A2B --> ENTQ["实体检索词 entities"]
@@ -35,34 +38,36 @@ flowchart TD
         CTXQ --> CR["子块向量召回<br/>父块展开 + 父块去重"]
         EXP --> RR["bge-reranker 精排<br/>实体 0.6 / 上下文 0.4"]
         CR --> RR
-        RR --> GM["GM 生成回复<br/>最近 5 轮原文 + 主线 + 召回"]
+        RR --> STATE["state 节点<br/>读 game_states<br/>attack 检定 / 时间 / 状态"]
+        STATE --> GM["GM 五段提示词<br/>核心规则 + 本轮契约 + 玩家自定义<br/>+ 世界书 + 记忆<br/>状态卡 + 本轮结算"]
+        GM --> RECON["reconcile<br/>GM effects 校验<br/>HP / 标签 / flag / 时间"]
+        RECON --> PERSIST["persist<br/>消息 + state_events + game_states"]
     end
 
-    GM --> PERSIST["persist<br/>消息落库 + 本轮 L0 摘要暂存"]
     PERSIST --> REPLY["返回玩家"]
+    PERSIST --> BG
 
-    subgraph BG["后台任务（BackgroundTasks，顺序受 ingest_lock 约束）"]
+    subgraph BG["后台任务（BackgroundTasks，ingest_lock 串行）"]
         API3["API3 实体/属性/关系固化"]
         ING["5 轮增量向量入库"]
-        PLOTM["主线维护<br/>L0 归档 / 生成 L1 / 更新 L2"]
+        PLOTM["主线维护<br/>L0 归档 / L1 / L2"]
     end
 
-    PERSIST --> API3
-    PERSIST --> ING
-    PERSIST --> PLOTM
-
     subgraph STORE["存储"]
-        PG[("PostgreSQL + pgvector<br/>messages / chunks / entity_index<br/>retrieval_traces / plot_nodes")]
-        NEO[("Neo4j<br/>Entity / AttributeChange / REL")]
+        PG[("PostgreSQL + pgvector<br/>messages / chunks / entity_index<br/>retrieval_traces / plot_nodes<br/>game_states / state_events / checkpoints")]
+        NEO[("Neo4j<br/>Entity / AttributeChange / REL<br/>relation_label 自由标签")]
+        L0["L0 单轮摘要 + 时间标签"]
+        L1["L1 章节摘要"]
+        L2["L2 全局梗概"]
     end
 
     API3 --> NEO
     API3 --> PG
     ING --> PG
-    PERSIST --> L0["L0 单轮摘要"]
+    PERSIST --> L0
     PLOTM --> L0
-    PLOTM --> L1["L1 章节摘要"]
-    PLOTM --> L2["L2 全局梗概"]
+    PLOTM --> L1
+    PLOTM --> L2
     L2 --> GM
     L1 --> GM
 
@@ -84,18 +89,35 @@ flowchart TD
   <div class="diagram">
   <pre class="mermaid">
 flowchart LR
-    WT["世界文本<br/>doc_id / char_start / char_end"] --> SPLIT["按 20000 字切窗"]
-    SPLIT --> PAR["6 路并行抽取<br/>单窗超时 240s；失败二分"]
+    WT["世界文本<br/>doc_id / char_start / char_end"] --> SPLIT["按窗口切分<br/>默认 20000 字"]
+    SPLIT --> PAR["N 路并行抽取<br/>默认 6；超时/失败二分"]
     WT --> VEC["父子段切分 + 向量化<br/>只嵌入子块"]
-    PAR --> CONS["整理 agent<br/>按 30000 字符树形合并"]
-    CONS --> MATCH{"会话已有实体？"}
+    PAR --> CONS["整理 agent<br/>树形合并 / 别名 / 自由关系标签"]
+    CONS --> EVENT["重要约定/事件实体化<br/>婚约 / 三年之约 / 拜师 / 契约"]
+    EVENT --> MATCH{"会话已有实体？"}
     MATCH -- 否 --> CREATE["entity_commit_plan<br/>create"]
     MATCH -- 是 / append --> UPDATE["规范名/别名匹配<br/>update + 新增"]
-    CREATE --> NEO[("Neo4j")]
+    CREATE --> NEO[("Neo4j<br/>Entity / REL.relation_label")]
     UPDATE --> NEO
     CREATE --> PG[("PG entity_index")]
     UPDATE --> PG
     VEC --> PG
+  </pre>
+  </div>
+
+  <h2>3. 可迁移内容与应用场景</h2>
+  <div class="diagram">
+  <pre class="mermaid">
+flowchart LR
+    WT["世界文本 / 设定集"] --> K["记忆内核"]
+    GP["GM 提示词<br/>角色 / 契约 / OOC / 输出格式"] --> K
+    ER["实体与关系 schema<br/>类型 / 自由标签 / 事件实体"] --> K
+    TS["工具与状态引擎<br/>检定 / 伤害 / 资源 / 时间"] --> K
+    CP["玩家自定义<br/>提示词 / 世界书 / 临时要求"] --> K
+    K --> N["小说生成"]
+    K --> T["文字互动游玩 / AI TRPG"]
+    K --> C["个人陪伴助手"]
+    K --> D["数字人 / 角色代理"]
   </pre>
   </div>
 

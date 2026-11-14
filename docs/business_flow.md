@@ -3,33 +3,49 @@
 > 本文描述的是**可迁移记忆内核的参考实现**，不是最终规格。用于核对理解，发现偏差请直接指出。
 > 内核不绑定具体作品；Streamlit、游戏 GM、数值/时间状态是参考前端与扩展层。验证结果见 `docs/eval_glm_2026-11-14.md`。
 
+## 0. 可迁移边界
+
+| 可替换层 | 内容 | 入口 |
+|---|---|---|
+| 世界观 | 小说/设定集/增量文本 | 世界导入 |
+| GM | 角色、契约、OOC、输出格式 | `prompts/gm_*.md` |
+| 实体/关系 | 类型、自由关系标签、事件实体化 | `domain/` + 导入/固化提示词 |
+| 玩家自定义 | 自定义提示词、世界书、临时要求 | `ClientContext` |
+| 工具/状态 | 检定、伤害、资源、时间/历法 | `numeric_engine.py` + 规则包 |
+
+适用场景：长对话小说生成、文字互动游玩 / AI TRPG、个人陪伴助手、数字人。共同需求是实时更新、跨多轮一致、初期设定导入和后期自定义。
+
 ## 1. 系统全景
 
 ```mermaid
 flowchart TD
-    U[用户 / Streamlit] --> API[FastAPI /api/threads/.../messages]
+    U[用户 / Streamlit<br/>ClientContext: 自定义提示词 / 世界书] --> API[FastAPI /api/threads/.../messages]
     API --> G[LangGraph ConversationGraph]
-
-    G --> P[prepare<br/>取新 turn_no / 清空上一轮字段]
-    P --> A2[pre_turn<br/>API 2]
-    A2 --> QE[API2 合并 LLM：查询增强 + 实体抽取]
-    QE --> KR[Neo4j 关键词召回]
-    QE --> VR[PostgreSQL entity_index 向量召回]
+    G --> CL[输入分流<br/>narrative / meta / mixed]
+    CL -- meta --> M[元交互<br/>OOC / 临时要求<br/>不落库、不计 turn]
+    CL -- narrative / mixed --> P[prepare<br/>取新 turn_no / 清空上一轮字段]
+    P --> A2[pre_turn<br/>API2 两路并行：总结/改写 + 实体假设]
+    A2 --> KR[Neo4j 关键词召回]
+    A2 --> VR[PostgreSQL entity_index 向量召回]
+    A2 --> CR[上下文子块召回]
+    A2 --> PL[主线召回<br/>L2 常驻 + L1 章节]
     KR --> F[entity_id 去重 + RRF]
     VR --> F
     F --> GE[entity_get + 1~2 跳扩展]
-    GE --> CR[上下文子块召回<br/>k=30]
-    CR --> CD[parent_no 父块去重]
     GE --> RR[bge-reranker-v2-m3 精排<br/>实体 0.6 / 上下文 0.4]
-    CD --> RR
-    RR --> GM[generate<br/>主 GM 回复]
-    GM --> PS[persist<br/>消息落库]
+    CR --> RR
+    PL --> RR
+    RR --> ST[state<br/>读 game_states<br/>attack 检定 / 时间 / 状态]
+    ST --> GM[generate<br/>五段提示词 + 状态卡 + 结算<br/>隐藏 plan，只返回 reply]
+    GM --> RC[reconcile<br/>GM effects 校验<br/>HP / 标签 / flag / 时间]
+    RC --> PS[persist<br/>消息 + state_events + game_states]
     PS --> PG[(PostgreSQL)]
     PS --> BG1[后台 API 3<br/>实体/关系固化]
     PS --> BG2[后台 5 轮入库<br/>文本向量化]
+    PS --> BG3[后台主线维护<br/>L0 归档 / L1 / L2]
 
     BG1 --> MCP[MCP 工具层]
-    MCP --> N4[(Neo4j)]
+    MCP --> N4[(Neo4j<br/>relation_label 自由标签)]
     MCP --> PG
     BG2 --> CH[语义父子段切分]
     CH --> EMB[embedding]
@@ -42,8 +58,9 @@ flowchart TD
 flowchart LR
     T[世界文本] --> C[父子段切分 + embedding<br/>与检索链路一致]
     T --> E[实体抽取<br/>短文本直接抽 / 长文本 20000 字切窗并行]
-    E --> A[检查修复 agent<br/>合并实体/别名/关系]
-    A --> W[entity_commit_plan<br/>初始化 Neo4j + PG 索引]
+    E --> A[检查修复 agent<br/>合并实体/别名/自由关系标签]
+    A --> EV[重要约定/事件实体化<br/>婚约 / 三年之约 / 拜师 / 契约]
+    EV --> W[entity_commit_plan<br/>初始化 Neo4j + PG 索引]
 ```
 
 - 检索切片与实体抽取窗口**解耦**：抽取不复用父子段，避免同一实体反复抽取。
@@ -54,9 +71,9 @@ flowchart LR
 
 存储职责：
 
-- **PostgreSQL**：线程、消息、批次、文本父子段、实体派生向量索引、mention、召回轨迹、工具调用日志、LangGraph checkpoint。
+- **PostgreSQL**：线程、消息、批次、文本父子段、实体派生向量索引、mention、召回轨迹、主线摘要、游戏状态/状态事件、工具调用日志、LangGraph checkpoint。
 - **pgvector**：文本片段向量、实体名称向量。
-- **Neo4j**：实体、属性变更、关系，是实体与关系的权威来源。
+- **Neo4j**：实体、属性变更、关系，是实体与关系的权威来源；关系使用自由 `relation_label`，重要约定/事件可实体化。
 - **MCP 工具层**：API 2/3 与数据库之间的唯一入口；当前 API 2/3 进程内调用同一实现，MCP server 也可独立通过 streamable HTTP 暴露。
 
 ## 2. 一轮对话时序
@@ -236,6 +253,8 @@ flowchart TD
 | `chunks` | 文本父子段与向量 |
 | `retrieval_traces` | 每次 API 2 的完整召回轨迹 |
 | `plot_nodes` | 三层主线：L0 单轮摘要 / L1 章节摘要 / L2 全局梗概 |
+| `game_states` | 数值/时间/装备/物品实例等游戏状态 |
+| `state_events` | 每轮状态变化，供回退恢复 |
 | `entity_index` | Neo4j 实体的派生名称向量索引 |
 | `entity_mentions` | 实体 → 消息/片段/批次/trace |
 | `entity_index_jobs` | PG 索引失败记录（只写不消费，重试 worker 未实现） |
@@ -246,7 +265,7 @@ flowchart TD
 
 - `:Entity`：`entity_id/thread_id/canonical_name/entity_type/aliases/summary/...`
 - `:AttributeChange`：append-only 属性变更
-- `:REL`：实体关系，允许多重边
+- `:REL`：实体关系，允许多重边；`relation_label` 为自由短语，不做枚举
 - 所有查询强制 `thread_id`。
 
 ### 关键标识
